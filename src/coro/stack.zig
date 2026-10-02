@@ -25,7 +25,9 @@ const is_pre_016 = builtin.zig_version.major == 0 and builtin.zig_version.minor 
 const SigInt = if (is_pre_016) c_int else posix.SIG;
 
 // Stack growth signal handler state (POSIX only)
-threadlocal var altstack_installed: bool = false;
+// Nesting depth of setupStackGrowth() on this thread. While it is nonzero the
+// thread has its alternate signal stack and holds one handler reference.
+threadlocal var setup_depth: usize = 0;
 threadlocal var altstack_mem: ?[]u8 = null;
 var signal_handler_refcount: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 var old_sigsegv_action: posix.Sigaction = undefined;
@@ -453,13 +455,15 @@ fn stackExtendWindows(_: *StackInfo) error{StackOverflow}!void {
 }
 
 /// Setup automatic stack growth via SIGSEGV handler for this thread.
-/// This function is idempotent - safe to call multiple times per thread.
+/// Calls nest: each call must be paired with one cleanupStackGrowth().
 ///
-/// On first call (any thread): Installs global SIGSEGV signal handler
-/// On every call: Sets up alternate signal stack for this thread if not already configured
+/// On the outermost call per thread: Sets up the thread's alternate signal stack
+/// and takes one reference on the global handler, installing it if this is the
+/// first reference in the process.
+/// On nested calls: Only increments this thread's setup depth.
 /// On Windows: No-op (stack growth is automatic via PAGE_GUARD)
 ///
-/// Must be called once per thread before using coroutines on that thread.
+/// Must be called on each thread before using coroutines on that thread.
 pub fn setupStackGrowth() !void {
     // Windows handles stack growth automatically via PAGE_GUARD.
     // OpenBSD stacks are fully committed at allocation time (MAP_STACK cannot be
@@ -467,27 +471,28 @@ pub fn setupStackGrowth() !void {
     // faults on the guard page and crashes.
     if (builtin.os.tag == .windows or builtin.os.tag == .openbsd) return;
 
-    const altstack_size = posix.SIGSTKSZ;
-
-    // Setup alternate stack for this thread if not already done
-    if (!altstack_installed) {
-        const mem = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(page_size), altstack_size);
-        errdefer std.heap.page_allocator.free(mem);
-
-        var stack = posix.stack_t{
-            .flags = 0,
-            .sp = mem.ptr,
-            .size = altstack_size,
-        };
-
-        try posix.sigaltstack(&stack, null);
-
-        altstack_mem = mem;
-        altstack_installed = true;
+    if (setup_depth > 0) {
+        setup_depth += 1;
+        return;
     }
 
-    // Install global signal handler (once per process)
-    // Increment refcount; if this is the first caller, install the handler
+    const altstack_size = posix.SIGSTKSZ;
+
+    const mem = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(page_size), altstack_size);
+    errdefer std.heap.page_allocator.free(mem);
+
+    var stack = posix.stack_t{
+        .flags = 0,
+        .sp = mem.ptr,
+        .size = altstack_size,
+    };
+
+    try posix.sigaltstack(&stack, null);
+
+    altstack_mem = mem;
+    setup_depth = 1;
+
+    // Increment refcount; if this is the first reference, install the handler
     const prev_refcount = signal_handler_refcount.fetchAdd(1, .acquire);
     if (prev_refcount == 0) {
         var sa = posix.Sigaction{
@@ -505,9 +510,10 @@ pub fn setupStackGrowth() !void {
     }
 }
 
-/// Cleanup stack growth handler state for this thread.
-/// Disables the alternate stack and frees its memory.
-/// Decrements the global signal handler refcount and uninstalls the handler when it reaches 0.
+/// Undo one setupStackGrowth() call on this thread.
+/// The outermost call disables the alternate stack, frees its memory and releases
+/// the thread's handler reference, restoring the old handlers after the last one.
+/// A call without a matching setup on this thread is a no-op.
 /// On Windows: No-op (nothing to clean up)
 ///
 /// Should be called when a thread exits if setupStackGrowth() was called.
@@ -515,27 +521,27 @@ pub fn cleanupStackGrowth() void {
     // Windows and OpenBSD install no growth handler / alternate stack.
     if (builtin.os.tag == .windows or builtin.os.tag == .openbsd) return;
 
-    if (altstack_installed) {
-        // Disable alternate stack
-        var disable_stack = posix.stack_t{
-            .flags = posix.SS.DISABLE,
-            .sp = null,
-            .size = 0,
-        };
-        posix.sigaltstack(&disable_stack, null) catch {
-            // Best effort - can't do much if this fails
-        };
+    if (setup_depth == 0) return;
+    setup_depth -= 1;
+    if (setup_depth > 0) return;
 
-        // Free the alternate stack memory
-        if (altstack_mem) |mem| {
-            std.heap.page_allocator.free(mem);
-            altstack_mem = null;
-        }
+    // Disable alternate stack
+    var disable_stack = posix.stack_t{
+        .flags = posix.SS.DISABLE,
+        .sp = null,
+        .size = 0,
+    };
+    posix.sigaltstack(&disable_stack, null) catch {
+        // Best effort - can't do much if this fails
+    };
 
-        altstack_installed = false;
+    // Free the alternate stack memory
+    if (altstack_mem) |mem| {
+        std.heap.page_allocator.free(mem);
+        altstack_mem = null;
     }
 
-    // Decrement refcount; if this was the last thread, uninstall the handler
+    // Decrement refcount; if this was the last reference, uninstall the handler
     const prev_refcount = signal_handler_refcount.fetchSub(1, .release);
     if (prev_refcount == 1) {
         // We were the last thread - restore the old signal handlers
@@ -668,6 +674,65 @@ fn abortOnStackOverflow(fault_addr: usize, stack_info: *const StackInfo) noretur
     std.process.abort();
 }
 
+test "Stack: growth lifecycle nests per thread" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .openbsd) return error.SkipZigTest;
+
+    const signals = if (builtin.os.tag.isDarwin())
+        [_]SigInt{ posix.SIG.SEGV, posix.SIG.BUS }
+    else
+        [_]SigInt{posix.SIG.SEGV};
+    var before: [signals.len]posix.Sigaction = undefined;
+    for (signals, &before) |signal, *action| posix.sigaction(signal, null, action);
+
+    // Two overlapping users on one thread, like two runtimes (#811): the
+    // inner one's cleanup must leave growth working for the outer one.
+    try setupStackGrowth();
+    errdefer cleanupStackGrowth();
+    try setupStackGrowth();
+    cleanupStackGrowth();
+
+    var alternate_stack: posix.stack_t = undefined;
+    try posix.sigaltstack(null, &alternate_stack);
+    try std.testing.expect(alternate_stack.flags & posix.SS.DISABLE == 0);
+    try runGrowingCoroutine();
+
+    cleanupStackGrowth();
+    try posix.sigaltstack(null, &alternate_stack);
+    try std.testing.expect(alternate_stack.flags & posix.SS.DISABLE != 0);
+    for (signals, before) |signal, action| {
+        var after: posix.Sigaction = undefined;
+        posix.sigaction(signal, null, &after);
+        try std.testing.expectEqual(action.handler.sigaction, after.handler.sigaction);
+    }
+}
+
+test "Stack: growth lifecycle cleanup only releases the owning thread" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .openbsd or builtin.single_threaded)
+        return error.SkipZigTest;
+
+    try setupStackGrowth();
+    defer cleanupStackGrowth();
+    var installed: posix.Sigaction = undefined;
+    posix.sigaction(posix.SIG.SEGV, null, &installed);
+
+    const Worker = struct {
+        fn run(setup: bool) void {
+            if (setup) setupStackGrowth() catch @panic("stack growth setup failed");
+            cleanupStackGrowth();
+            cleanupStackGrowth();
+        }
+    };
+    // Neither a thread that never set up growth nor one that already cleaned
+    // up may remove the handler still needed by this thread.
+    for ([_]bool{ false, true }) |setup| {
+        const worker = try std.Thread.spawn(.{}, Worker.run, .{setup});
+        worker.join();
+        var after: posix.Sigaction = undefined;
+        posix.sigaction(posix.SIG.SEGV, null, &after);
+        try std.testing.expectEqual(installed.handler.sigaction, after.handler.sigaction);
+    }
+}
+
 test "Stack: alloc/free" {
     const maximum_size = 8192;
     const committed_size = 1024;
@@ -738,11 +803,8 @@ test "Stack: extend" {
     @memset(extended_region[0..1024], 0xAA);
 }
 
-test "Stack: automatic growth" {
-    // Setup signal handler (no-op on Windows where PAGE_GUARD handles it automatically)
-    try setupStackGrowth();
-    defer cleanupStackGrowth();
-
+/// Run a coroutine on a stack with a tiny initial commit that has to grow.
+fn runGrowingCoroutine() !void {
     var parent_context: coroutines.Context = undefined;
     var coro: coroutines.Coroutine = .{
         .parent_context_ptr = &parent_context,
@@ -793,6 +855,14 @@ test "Stack: automatic growth" {
     // Verify stack grew beyond initial commit
     const final_committed = coro.context.stack_info.base - coro.context.stack_info.limit;
     try std.testing.expect(final_committed >= initial_committed);
+}
+
+test "Stack: automatic growth" {
+    // Setup signal handler (no-op on Windows where PAGE_GUARD handles it automatically)
+    try setupStackGrowth();
+    defer cleanupStackGrowth();
+
+    try runGrowingCoroutine();
 }
 
 test "Stack: recycle" {

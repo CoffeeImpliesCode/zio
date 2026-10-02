@@ -43,6 +43,10 @@ All notable changes to this project will be documented in this file.
 - Fixed a panic in `Runtime.init` with more than one executor when logging through
   `zio.debug_io` (#804).
 
+- Fixed coroutine stack growth crashing after one of two runtimes created on the same thread
+  was deinitialized while the other was still running, and cleanup on a thread that never
+  set up stack growth releasing another thread's signal handler reference (#811).
+
 ## [0.19.0] - 2026-10-05
 
 This is the last release for Zig 0.16. Later releases require Zig 0.17, and Zig 0.16
