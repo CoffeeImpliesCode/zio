@@ -259,3 +259,75 @@ test "ev.ThreadPool: regular work still scales when reserved work occupies max_t
 
     reserved.gate.set();
 }
+
+/// Virtual memory size of this process in KiB. A thread that exited but was
+/// never joined keeps its stack mapped, so leaked threads show up here.
+fn virtualMemoryKiB() !u64 {
+    const fd = std.c.open("/proc/self/status", .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.Unexpected;
+    defer _ = std.c.close(fd);
+    var buf: [8192]u8 = undefined;
+    const n = std.c.read(fd, &buf, buf.len);
+    if (n <= 0) return error.Unexpected;
+    const status = buf[0..@intCast(n)];
+    const start = std.mem.indexOf(u8, status, "VmSize:") orelse return error.Unexpected;
+    var fields = std.mem.tokenizeAny(u8, status[start + "VmSize:".len ..], " \t\n");
+    return std.fmt.parseInt(u64, fields.next() orelse return error.Unexpected, 10);
+}
+
+/// Signals when the pool is done with the work, including its completion.
+const SignaledJob = struct {
+    done: ResetEvent = .init(),
+
+    fn main(_: *ev.Work) void {}
+
+    fn complete(ctx: ?*anyopaque, _: *ev.Work) void {
+        const self: *SignaledJob = @ptrCast(@alignCast(ctx));
+        self.done.set();
+    }
+};
+
+test "ev.ThreadPool: workers that exit on the idle timeout are joined" {
+    if (builtin.single_threaded or builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var thread_pool: ev.ThreadPool = undefined;
+    try thread_pool.init(std.testing.allocator, .{
+        .min_threads = 0,
+        .max_threads = 1,
+        .idle_timeout_ms = 1,
+    });
+    defer thread_pool.deinit();
+
+    const before = try virtualMemoryKiB();
+    for (0..48) |_| {
+        // Each job spawns a worker that then times out and removes itself.
+        var job: SignaledJob = .{};
+        defer job.done.deinit();
+        var work = ev.Work.init(&SignaledJob.main, null);
+        work.completion_fn = &SignaledJob.complete;
+        work.completion_context = &job;
+        thread_pool.submit(&work);
+        job.done.wait();
+        while (thread_pool.running_threads.load(.monotonic) != 0) os_thread.yield();
+    }
+    const after = try virtualMemoryKiB();
+
+    // 48 unjoined threads would keep 48 * 16 MiB of stacks mapped.
+    try std.testing.expect(after -| before < 256 * 1024);
+}
+
+test "ev.ThreadPool: stop joins workers that removed themselves" {
+    if (builtin.single_threaded or builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const before = try virtualMemoryKiB();
+    for (0..24) |_| {
+        // Every worker wakes on stop() at once and removes itself from the
+        // pool while stop() is still joining the others.
+        var thread_pool: ev.ThreadPool = undefined;
+        try thread_pool.init(std.testing.allocator, .{ .min_threads = 8, .max_threads = 8 });
+        thread_pool.deinit();
+    }
+    const after = try virtualMemoryKiB();
+
+    try std.testing.expect(after -| before < 256 * 1024);
+}

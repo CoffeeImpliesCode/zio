@@ -51,6 +51,10 @@ All notable changes to this project will be documented in this file.
   leaving one of them without the stack growth handler, or losing the program's previous
   `SIGSEGV` handler.
 
+- Fixed blocking thread pool workers that exited on the idle timeout, or on shutdown before
+  the pool reached them, never being joined. Each kept its thread stack mapped, and
+  `Runtime.deinit` could return while such a worker was still exiting.
+
 ## [0.19.0] - 2026-10-05
 
 This is the last release for Zig 0.16. Later releases require Zig 0.17, and Zig 0.16

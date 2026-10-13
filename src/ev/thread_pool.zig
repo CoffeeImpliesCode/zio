@@ -12,6 +12,13 @@ pub const ThreadPool = struct {
     allocator: std.mem.Allocator,
 
     workers: std.ArrayList(Worker) = .empty,
+    /// Threads of workers that removed themselves on an idle timeout. A thread
+    /// can't join itself, so its handle waits here for the next spawnThread()
+    /// or stop() to join it. Guarded by `workers_mutex`.
+    retired: std.ArrayList(std.Thread) = .empty,
+    /// Set by stop() once it has taken every thread handle; no worker may be
+    /// spawned afterwards. Guarded by `workers_mutex`.
+    stopped: bool = false,
     workers_mutex: os.Mutex = .init(),
     next_worker_id: u64 = 0,
 
@@ -96,7 +103,18 @@ pub const ThreadPool = struct {
         self.workers_mutex.lock();
         defer self.workers_mutex.unlock();
 
+        // stop() has joined every worker; a thread spawned now would never be.
+        if (self.stopped) return;
+
+        // A retired worker put its handle here under this lock and doesn't
+        // touch the pool afterwards, so joining it only waits for its exit.
+        for (self.retired.items) |thread| thread.join();
+        self.retired.clearRetainingCapacity();
+
         if (!forced and self.workers.items.len >= self.max_threads + self.reserved_running.load(.monotonic)) return;
+
+        // Room for every worker to retire without allocating in removeThread.
+        try self.retired.ensureTotalCapacity(self.allocator, self.workers.items.len + 1);
 
         _ = self.running_threads.fetchAdd(1, .monotonic);
         errdefer _ = self.running_threads.fetchSub(1, .monotonic);
@@ -123,14 +141,17 @@ pub const ThreadPool = struct {
 
         log.debug("Removing thread {}", .{worker_id});
 
+        _ = self.running_threads.fetchSub(1, .monotonic);
         for (self.workers.items, 0..) |*worker, i| {
             if (worker.worker_id == worker_id) {
-                _ = self.workers.swapRemove(i);
-                _ = self.running_threads.fetchSub(1, .monotonic);
+                const removed = self.workers.swapRemove(i);
+                self.retired.appendAssumeCapacity(removed.thread);
                 return true;
             }
         }
-        unreachable;
+        // stop() has already taken this worker's thread and joins it.
+        std.debug.assert(self.stopped);
+        return true;
     }
 
     pub fn deinit(self: *ThreadPool) void {
@@ -138,6 +159,7 @@ pub const ThreadPool = struct {
         // calling it again here is safe if the caller did not stop() first).
         self.stop();
         self.workers.deinit(self.allocator);
+        self.retired.deinit(self.allocator);
 
         // Pair with the install in init (refcounted; restores on the last pool).
         os.syscall_cancel.uninstallHandler();
@@ -163,19 +185,23 @@ pub const ThreadPool = struct {
             self.queue_not_empty.broadcast();
         }
 
-        // Join all threads - they will remove themselves from the list.
-        // We need to keep joining until all workers are gone.
-        while (true) {
-            self.workers_mutex.lock();
-            const thread = if (self.workers.items.len > 0) self.workers.items[0].thread else null;
-            self.workers_mutex.unlock();
+        // Take every worker's thread, live or retired, and join them all. A
+        // worker removing itself after this finds its entry gone and exits;
+        // its handle is joined here. Taking the handles under the lock, rather
+        // than joining whichever worker is still listed, also catches workers
+        // that already removed themselves.
+        self.workers_mutex.lock();
+        var workers = self.workers;
+        var retired = self.retired;
+        self.workers = .empty;
+        self.retired = .empty;
+        self.stopped = true;
+        self.workers_mutex.unlock();
+        defer workers.deinit(self.allocator);
+        defer retired.deinit(self.allocator);
 
-            if (thread) |t| {
-                t.join();
-            } else {
-                break;
-            }
-        }
+        for (workers.items) |worker| worker.thread.join();
+        for (retired.items) |thread| thread.join();
     }
 
     pub fn submit(self: *ThreadPool, work: *Work) void {
