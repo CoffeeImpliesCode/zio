@@ -47,6 +47,10 @@ All notable changes to this project will be documented in this file.
   was deinitialized while the other was still running, and cleanup on a thread that never
   set up stack growth releasing another thread's signal handler reference (#811).
 
+- Fixed runtimes created and destroyed at the same time on different threads possibly
+  leaving one of them without the stack growth handler, or losing the program's previous
+  `SIGSEGV` handler.
+
 ## [0.19.0] - 2026-10-05
 
 This is the last release for Zig 0.16. Later releases require Zig 0.17, and Zig 0.16

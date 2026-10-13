@@ -8,6 +8,7 @@ const fs = @import("../os/fs.zig");
 const w = @import("../os/windows.zig");
 const coroutines = @import("coroutines.zig");
 const compat = @import("../compat.zig");
+const os = @import("../os/root.zig");
 
 const log = @import("../common.zig").log;
 
@@ -29,7 +30,12 @@ const SigInt = if (is_pre_016) c_int else posix.SIG;
 // thread has its alternate signal stack and holds one handler reference.
 threadlocal var setup_depth: usize = 0;
 threadlocal var altstack_mem: ?[]u8 = null;
-var signal_handler_refcount: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+// Process-wide handler references, one per thread with setup_depth > 0. The
+// mutex covers the count together with installing and restoring the handlers,
+// so no thread holds a reference while the handler is absent, and a removal
+// can't interleave with the next install.
+var handler_mutex: os.Mutex = .init();
+var handler_refcount: usize = 0;
 var old_sigsegv_action: posix.Sigaction = undefined;
 var old_sigbus_action: posix.Sigaction = undefined;
 
@@ -492,9 +498,11 @@ pub fn setupStackGrowth() !void {
     altstack_mem = mem;
     setup_depth = 1;
 
-    // Increment refcount; if this is the first reference, install the handler
-    const prev_refcount = signal_handler_refcount.fetchAdd(1, .acquire);
-    if (prev_refcount == 0) {
+    // Take a reference; the first one installs the handler
+    handler_mutex.lock();
+    defer handler_mutex.unlock();
+    handler_refcount += 1;
+    if (handler_refcount == 1) {
         var sa = posix.Sigaction{
             .handler = .{ .sigaction = stackFaultHandler },
             .mask = posix.sigemptyset(),
@@ -541,9 +549,11 @@ pub fn cleanupStackGrowth() void {
         altstack_mem = null;
     }
 
-    // Decrement refcount; if this was the last reference, uninstall the handler
-    const prev_refcount = signal_handler_refcount.fetchSub(1, .release);
-    if (prev_refcount == 1) {
+    // Drop the reference; the last one restores the old signal handlers
+    handler_mutex.lock();
+    defer handler_mutex.unlock();
+    handler_refcount -= 1;
+    if (handler_refcount == 0) {
         // We were the last thread - restore the old signal handlers
         posix.sigaction(posix.SIG.SEGV, &old_sigsegv_action, null);
         if (builtin.os.tag.isDarwin()) {
@@ -731,6 +741,38 @@ test "Stack: growth lifecycle cleanup only releases the owning thread" {
         posix.sigaction(posix.SIG.SEGV, null, &after);
         try std.testing.expectEqual(installed.handler.sigaction, after.handler.sigaction);
     }
+}
+
+test "Stack: growth handler stays installed under concurrent setup and cleanup" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .openbsd or builtin.single_threaded)
+        return error.SkipZigTest;
+
+    var before: posix.Sigaction = undefined;
+    posix.sigaction(posix.SIG.SEGV, null, &before);
+
+    const Worker = struct {
+        fn run(unprotected: *std.atomic.Value(u32)) void {
+            for (0..2_000) |_| {
+                setupStackGrowth() catch @panic("stack growth setup failed");
+                // Holding a reference, this thread must see the growth handler.
+                var current: posix.Sigaction = undefined;
+                posix.sigaction(posix.SIG.SEGV, null, &current);
+                if (current.handler.sigaction != &stackFaultHandler) _ = unprotected.fetchAdd(1, .monotonic);
+                cleanupStackGrowth();
+            }
+        }
+    };
+    // Threads repeatedly take the handler count across zero, racing the
+    // first install against later references and removal against reinstall.
+    var unprotected: std.atomic.Value(u32) = .init(0);
+    var threads: [8]std.Thread = undefined;
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, Worker.run, .{&unprotected});
+    for (threads) |thread| thread.join();
+
+    try std.testing.expectEqual(0, unprotected.load(.monotonic));
+    var after: posix.Sigaction = undefined;
+    posix.sigaction(posix.SIG.SEGV, null, &after);
+    try std.testing.expectEqual(before.handler.sigaction, after.handler.sigaction);
 }
 
 test "Stack: alloc/free" {
