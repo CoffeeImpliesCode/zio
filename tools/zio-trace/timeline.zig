@@ -7,13 +7,14 @@ pub const Slice = struct {
     thread: u64,
     start: f64,
     end: f64,
-    kind: enum { task, state, park, zone, work },
+    kind: enum { task, state, park, zone },
     id: u64 = 0,
     state: State = .scheduler,
 };
 pub const Flow = struct { task: u64, source_thread: u64, target_thread: u64, start: f64, end: f64 };
 pub const Thread = struct {
     info: format.record.Thread,
+    metadata_known: bool = true,
     classes: ?u64 = null,
     durations: [state_count]f64 = @splat(0),
     first: ?f64 = null,
@@ -25,11 +26,15 @@ pub const Thread = struct {
     task_start: f64 = 0,
     poll: ?State = null,
     flush: bool = false,
-    work: ?u64 = null,
+    work_depth: usize = 0,
     park_start: ?f64 = null,
     steals: u64 = 0,
     parks: u64 = 0,
     state_slice: ?usize = null,
+
+    pub fn kindName(self: Thread) []const u8 {
+        return if (self.metadata_known) @tagName(self.info.kind) else "unknown";
+    }
 
     pub fn hasClass(self: Thread, class: format.EventClass) bool {
         return if (self.classes) |mask| mask & class.mask() != 0 else false;
@@ -37,6 +42,7 @@ pub const Thread = struct {
 
     fn state(self: Thread) State {
         if (self.flush) return .flush;
+        if (!self.metadata_known) return .unknown;
         return switch (self.info.kind) {
             .executor => self.poll orelse if (self.task != null)
                 State.task
@@ -46,7 +52,7 @@ pub const Thread = struct {
                 State.unknown,
             .blocking => if (!self.hasClass(.work))
                 .unknown
-            else if (self.work != null)
+            else if (self.work_depth != 0)
                 .work
             else
                 .idle,
@@ -55,6 +61,7 @@ pub const Thread = struct {
     }
 
     pub fn unavailableReason(self: Thread) ?[]const u8 {
+        if (!self.metadata_known) return "thread metadata missing";
         if (self.info.kind == .other) return "point events only";
         if (self.classes == null) return "recorded classes unknown";
         if (self.info.kind == .executor) {
@@ -99,14 +106,14 @@ pub const Samples = struct {
 pub const Zone = struct {
     name: []const u8 = "unknown zone",
     samples: Samples = .{},
-    cpu_samples: Samples = .{},
+    run_samples: Samples = .{},
     location: ?format.Payload(.srcloc) = null,
 };
 pub const Plot = struct { count: u64 = 0, min: i64 = std.math.maxInt(i64), max: i64 = std.math.minInt(i64), total: f64 = 0 };
 const PendingIo = struct { ns: f64, kind: u64 };
-const PendingWork = struct { queued: ?f64 = null, begin: ?f64 = null };
+const PendingWork = struct { queued: ?f64 = null, begin: ?struct { ns: f64, thread: u64 } = null };
 const ZoneOwner = struct { task: bool, id: u64 };
-const OpenZone = struct { srcloc: u64, ns: f64, thread: u64, cpu_ns: ?f64 };
+const OpenZone = struct { srcloc: u64, ns: f64, thread: u64, run_ns: ?f64 };
 pub const ZoneEvent = struct {
     thread: u64,
     ns: f64,
@@ -114,6 +121,16 @@ pub const ZoneEvent = struct {
     srcloc: u64,
     begin: bool,
 };
+pub const WorkSpan = struct {
+    work: u64,
+    begin_thread: u64,
+    end_thread: u64,
+    start: f64,
+    end: f64,
+    canceled: bool,
+    physical: bool,
+};
+pub const IoStats = [std.enums.values(format.IoResult).len]Samples;
 pub const Model = struct {
     session: session_mod.Session,
     threads: std.ArrayList(Thread) = .empty,
@@ -121,13 +138,17 @@ pub const Model = struct {
     tasks: std.AutoHashMapUnmanaged(u64, Task) = .empty,
     slices: std.ArrayList(Slice) = .empty,
     flows: std.ArrayList(Flow) = .empty,
-    io_stats: std.AutoHashMapUnmanaged(u64, Samples) = .empty,
+    io_stats: std.AutoHashMapUnmanaged(u64, IoStats) = .empty,
     zones: std.AutoHashMapUnmanaged(u64, Zone) = .empty,
     zone_stacks: std.AutoHashMapUnmanaged(ZoneOwner, std.ArrayList(OpenZone)) = .empty,
     zone_events: std.ArrayList(ZoneEvent) = .empty,
     plots: std.StringHashMapUnmanaged(Plot) = .empty,
     work_wait: Samples = .{},
     work_run: Samples = .{},
+    work_spans: std.ArrayList(WorkSpan) = .empty,
+    missing_threads: usize = 0,
+    pending_io: usize = 0,
+    io_pair_errors: usize = 0,
     incomplete_slices: usize = 0,
     task_pair_errors: usize = 0,
 
@@ -142,12 +163,29 @@ pub const Model = struct {
             .info = info.*,
             .classes = session.classMask(),
         });
+        for (self.threads.items, 0..) |t, i| try self.thread_indices.put(a, t.info.thread, i);
+        for (session.events.items) |event| {
+            if (self.thread_indices.contains(event.thread)) continue;
+            try self.thread_indices.put(a, event.thread, self.threads.items.len);
+            try self.threads.append(a, .{
+                .info = .{
+                    .thread = event.thread,
+                    .os_tid = 0,
+                    .kind = .other,
+                    .executor = format.no_executor,
+                    .name = "",
+                },
+                .metadata_known = false,
+                .classes = session.classMask(),
+            });
+            self.missing_threads += 1;
+        }
         std.mem.sort(Thread, self.threads.items, {}, threadLess);
         for (self.threads.items, 0..) |t, i| try self.thread_indices.put(a, t.info.thread, i);
         // Lifecycle markers take precedence even if a damaged file has events outside them.
         // Older traces retain first/last-event bounds independently for each missing marker.
         for (session.events.items) |event| {
-            const index = self.thread_indices.get(event.thread) orelse continue;
+            const index = self.thread_indices.get(event.thread).?;
             const t = &self.threads.items[index];
             if (t.first == null) t.first = event.ns;
             if (event.event == .thread_begin and !t.has_thread_begin) {
@@ -160,13 +198,13 @@ pub const Model = struct {
         var pending_io: std.AutoHashMapUnmanaged(u64, PendingIo) = .empty;
         var pending_work: std.AutoHashMapUnmanaged(u64, PendingWork) = .empty;
         for (session.events.items) |event| {
-            const index = self.thread_indices.get(event.thread) orelse continue;
+            const index = self.thread_indices.get(event.thread).?;
             const t = &self.threads.items[index];
             const now = event.ns;
             const previous = t.cursor_ns orelse now;
             const interval_start = @max(previous, t.first.?);
             const interval_end = @min(now, t.last);
-            if (interval_end > interval_start and t.info.kind != .other) {
+            if (interval_end > interval_start and (t.info.kind != .other or !t.metadata_known)) {
                 const state = t.state();
                 t.durations[@backingInt(state)] += interval_end - interval_start;
                 var merged = false;
@@ -256,27 +294,43 @@ pub const Model = struct {
                     t.park_start = null;
                 },
                 .steal => |v| t.steals += v.count,
-                .io_submit => |v| try pending_io.put(a, v.op, .{ .ns = now, .kind = v.kind }),
+                .io_submit => |v| {
+                    const pending = try pending_io.getOrPut(a, v.op);
+                    if (pending.found_existing) self.io_pair_errors += 1;
+                    pending.value_ptr.* = .{ .ns = now, .kind = v.kind };
+                },
                 .io_complete => |v| {
                     if (pending_io.fetchRemove(v.op)) |pending| {
                         const stats = try self.io_stats.getOrPut(a, pending.value.kind);
-                        if (!stats.found_existing) stats.value_ptr.* = .{};
-                        try stats.value_ptr.add(a, now - pending.value.ns);
-                    }
+                        if (!stats.found_existing) stats.value_ptr.* = @splat(.{});
+                        try stats.value_ptr[@backingInt(v.result)].add(a, now - pending.value.ns);
+                    } else self.io_pair_errors += 1;
                 },
                 .work_queue => |v| try pending_work.put(a, v.work, .{ .queued = now }),
                 .work_begin => |v| {
-                    t.work = v.work;
+                    if (t.metadata_known and t.info.kind == .blocking) t.work_depth += 1;
                     const pending = try pending_work.getOrPut(a, v.work);
                     if (!pending.found_existing) pending.value_ptr.* = .{};
-                    pending.value_ptr.begin = now;
+                    pending.value_ptr.begin = .{ .ns = now, .thread = event.thread };
                     if (pending.value_ptr.queued) |queued| try self.work_wait.add(a, now - queued);
                 },
                 .work_end => |v| {
-                    t.work = null;
                     if (pending_work.fetchRemove(v.work)) |pending| if (pending.value.begin) |begin| {
-                        try self.work_run.add(a, now - begin);
-                        try self.slices.append(a, .{ .thread = event.thread, .start = begin, .end = now, .kind = .work, .id = v.work });
+                        const worker = &self.threads.items[self.thread_indices.get(begin.thread).?];
+                        const physical = worker.metadata_known and worker.info.kind == .blocking and
+                            begin.thread == event.thread;
+                        if (worker.metadata_known and worker.info.kind == .blocking)
+                            worker.work_depth -|= 1;
+                        try self.work_run.add(a, now - begin.ns);
+                        try self.work_spans.append(a, .{
+                            .work = v.work,
+                            .begin_thread = begin.thread,
+                            .end_thread = event.thread,
+                            .start = begin.ns,
+                            .end = now,
+                            .canceled = v.canceled,
+                            .physical = physical,
+                        });
                     };
                 },
                 .srcloc => |v| {
@@ -297,7 +351,7 @@ pub const Model = struct {
                         .srcloc = v.srcloc,
                         .ns = now,
                         .thread = event.thread,
-                        .cpu_ns = if (t.task) |id|
+                        .run_ns = if (t.task) |id|
                             (try self.getTask(a, id)).run_total_ns + now - t.task_start
                         else
                             null,
@@ -324,9 +378,9 @@ pub const Model = struct {
                         _ = stack.pop();
                         const zone = try self.getZone(a, v.srcloc);
                         try zone.samples.add(a, now - opened.ns);
-                        if (opened.cpu_ns) |cpu_ns| {
+                        if (opened.run_ns) |run_ns| {
                             const task = try self.getTask(a, owner.id);
-                            try zone.cpu_samples.add(a, task.run_total_ns + now - t.task_start - cpu_ns);
+                            try zone.run_samples.add(a, task.run_total_ns + now - t.task_start - run_ns);
                         }
                         if (owner.task) {
                             try self.zone_events.append(a, .{
@@ -363,8 +417,9 @@ pub const Model = struct {
             if (t.poll != null) self.incomplete_slices += 1;
             if (t.flush) self.incomplete_slices += 1;
             if (t.park_start != null) self.incomplete_slices += 1;
-            if (t.work != null) self.incomplete_slices += 1;
         }
+        self.pending_io = pending_io.count();
+        self.incomplete_slices += pending_work.count();
         var stacks = self.zone_stacks.valueIterator();
         while (stacks.next()) |stack| self.incomplete_slices += stack.items.len;
         return self;

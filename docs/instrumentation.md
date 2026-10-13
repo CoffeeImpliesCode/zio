@@ -25,7 +25,7 @@ Use comma-separated names (surrounding whitespace is ignored):
 | --- | --- |
 | `sched` | Task lifecycle/functions, executor identity, parks and steals |
 | `loop` | Backend polls and loop wake syscalls |
-| `io` | Completion submit/complete |
+| `io` | Completion submit and terminal outcome |
 | `work` | Blocking work queue/begin/end |
 | `stacks` | Unknown-function spawn and first-suspend stacks |
 | `user` | Source locations, zones, messages and plots |
@@ -64,24 +64,39 @@ Strings are length-prefixed bytes, not NUL-terminated. Unknown records can be
 skipped; unknown events terminate decoding of their chunk. A crash can leave a
 truncated final record; earlier complete records remain readable.
 
-`task_begin` and `task_end` delimit actual coroutine execution, including direct
-coroutine-to-coroutine switches. In v2, an end carries only its reason and closes
-the latest begin on that thread. Reasons distinguish runnable yield, waiting,
-and completion. Main-task execution is separate from scheduler work; worker
-executors do not execute their synthetic main task. Nonzero task ids are
-session-unique and remain unchanged during migration. Threads reserve blocks of
-1,024 ids from a global counter, then assign locally; ordinary ids need only
-one to three varint bytes. Creation carries parent/group identity; wakes identify
-the emitting thread.
+`task_begin` and `task_end` delimit task execution, including direct switches and
+inline blocking work. An end carries only its reason and closes the latest begin
+on that thread. Reasons distinguish runnable yield, waiting, and completion.
+Inline blocking work pauses its parent's trace interval and uses a separate task
+ID. The parent resumes after the blocking scope returns, including after
+suspension or migration.
+
+Main-task execution is separate from scheduler work. Worker executors do not
+execute their synthetic main task. Nonzero task IDs are session-unique and stay
+unchanged during migration. Threads reserve blocks of 1,024 IDs from a global
+counter, then assign locally. Ordinary IDs need only one to three varint bytes.
+Creation carries parent/group identity. Wakes identify the emitting thread.
+If creator-thread registration fails, a task still gets a unique ID. The trace
+counts the missing creation record as loss instead of stopping the workload.
+
+A thread starts a new recorded lifetime when its runtime role or executor
+identity changes. Each lifetime uses a distinct thread index, even when the OS
+thread ID stays the same. Other-thread markers do not change an executor or
+worker role.
 
 Park events enclose executor idle handling. Poll events enclose only backend
 polls, not callback dispatch: timeout zero means a nonblocking check; the maximum
 u64 represents an unbounded wait. Loop wake events mean a backend wake was
-actually issued. Completion addresses identify I/O submissions and finishes;
-addresses may be reused after completion. Blocking work records distinguish queue
-submission and worker execution. User zones are nested begin/end events with a
-source-location definition preceding first use on each thread. Plots use signed
-64-bit values.
+actually issued. Completion addresses identify I/O submissions and terminal outcomes.
+Addresses may be reused after a terminal outcome. I/O events use the emitting
+thread's buffer, even when another thread owns the loop. A timer disarm records
+one canceled outcome. Resetting a running timer does not create another submission.
+Executor shutdown records cancellation for internal operations that remain armed.
+These records do not invoke callbacks or change completion state.
+
+Blocking work records distinguish queue submission and execution. User zones
+are nested begin/end events with a source-location definition preceding first
+use on each thread. Plots use signed 64-bit values.
 
 ## Function attribution
 
@@ -93,7 +108,9 @@ attribution in release builds requires frame pointers on both the executable
 and zio modules: set `.omit_frame_pointer = false` in their module options (or
 assign `exe.root_module.omit_frame_pointer = false` and
 `zio_module.omit_frame_pointer = false` in the build script). Keep DWARF for
-source lines. Inlining can still remove frames.
+source lines and inline contexts. The analyzer can recover an enclosing user
+function from a captured PC's inline metadata. Optimization can still remove
+frames or useful debug information.
 
 The tracer walks only increasing frame pointers inside known stack bounds; it
 never loads DWARF or performs CFI unwinding. Native stack bounds are queried once
@@ -122,10 +139,11 @@ The active fast path reads the hardware counter (RDTSC on x86_64, CNTVCT on
 AArch64; monotonic nanoseconds otherwise) and encodes into a thread-local 64 KiB
 buffer. Each registered thread owns two buffers. Full chunks are handed to one
 background writer. Public event hooks inline one monotonic class-mask load and
-bit test; active encoding and stack capture are out-of-line. Executor/loop hooks
-use cached thread pointers, avoiding TLS and generation lookup. Other-thread
-hooks use a generation-checked TLS cache. Slice-free events encode in one pass,
-using a compile-time size bound; strings/stacks use an exact-length check.
+bit test; active encoding and stack capture are out-of-line. Executor and
+loop-state hooks use cached thread pointers. I/O and other-thread hooks use a
+generation-checked TLS cache to retain producer ownership. Slice-free events
+encode in one pass with a compile-time size bound. Strings and stacks use an
+exact-length check.
 Most events need no lock. ID-block reservation and rollover use atomic handoffs.
 The writer blocks on a futex until a chunk or shutdown notification, with a
 calibration timeout of about one second.
@@ -215,13 +233,23 @@ Without a session argument, the analyzer selects the newest timestamp directory
 under the current directory's `.zio`. `--exe PATH` overrides the executable
 recorded in the trace. Keep the matching executable and its debug information:
 rebuilding at the same path can make recorded addresses resolve incorrectly.
+Use `-h` or `--help` after any command to show help without loading a session.
 
-`info` reports the clock fit, observed duration, threads, dropped events, decode
-errors, and incomplete intervals. Files ending mid-record retain all earlier
-complete records. Unknown record kinds are skipped; an unknown event ends only
-its chunk. Chunks are reordered by sequence number before event decoding.
-Nanoseconds come from a least-squares calibration fit, or a single calibration
-point and the nominal clock frequency.
+`info` reports the clock fit, observed duration, threads, dropped events, and
+recording diagnostics. A final end record confirms the total dropped count.
+Without it, the reported count is a lower bound. Reports, SVGs, and Perfetto
+exports show this distinction and warn about recording loss or damage.
+
+Files ending mid-record retain earlier complete records. The analyzer skips
+files with a different process, session timestamp, clock, or nominal frequency.
+It counts these header mismatches. Missing thread metadata does not discard
+events. The analyzer labels the thread unknown and does not estimate its utilization.
+Diagnostics also count incomplete slices, task/I/O pairing errors, and pending I/O.
+
+Unknown record kinds are skipped. An unknown event ends only its chunk.
+Chunks are reordered by sequence number before event decoding. Nanoseconds
+come from a least-squares calibration fit, or one calibration point and the
+nominal clock frequency.
 
 The analyzer reads format v2 only; older format versions are rejected rather
 than interpreted with the wrong event layout. Task ends carry no task ID: they
@@ -244,8 +272,10 @@ are unavailable. Messages and plots remain usable when `user` alone is recorded.
 `util` writes a self-contained, 1200-pixel-wide SVG and prints a thread table.
 Executor rows split each bin into task, scheduler, nonblocking poll, blocking
 poll, and tracing-flush time. Busy means task + scheduler + nonblocking poll;
-blocking workers use work / observed wall time, with the rest of their lifetime
-counted as idle (apart from trace-flush overhead). `thread_begin` and `thread_end`
+blocking workers use work / observed wall time. Nested jobs count their
+combined occupied interval once. The rest of the lifetime counts as idle,
+apart from trace-flush overhead. Inline work does not occupy a physical
+blocking worker. `thread_begin` and `thread_end`
 bound each thread's observed lifetime, including idle time before its first job
 and after its last. If lifecycle markers are missing, first/last events provide
 fallback bounds; either missing boundary falls back independently. Other threads display
@@ -255,33 +285,53 @@ Bins may average very short activity bursts.
 
 `stats` groups task slices by resolved function name and reports run time,
 wake-to-run latency, and completed-task lifetime. It also reports per-thread
-states, I/O submit-to-complete latency by operation, blocking queue/run time,
-steals, parks, zones, and plot summaries. Durations are in microseconds except
-the explicitly labelled thread-state table. Percentiles use the nearest rank.
-Unmatched operation endpoints and unfinished lifetimes are not latency samples.
+states, I/O submit-to-terminal latency, blocking queue/wall time, steals, parks,
+zones, and plot summaries. I/O distributions separate completed, failed, and
+canceled/disarmed outcomes by operation. Pending and unmatched I/O does not
+enter a latency distribution. Blocking wall duration includes suspension and
+OS waits. It is not CPU time, including for physical blocking workers.
+Durations use microseconds except the labeled thread-state table.
+Percentiles use the nearest rank. Unfinished task lifetimes are not latency samples.
+
+Text reports escape control characters and invalid UTF-8 bytes in labels.
+Printable Unicode remains readable.
 
 Source-location definitions apply process-wide. Zone stacks follow tasks across
 thread migration; markers outside a running task use the emitting thread's
-stack. Zone wall duration includes suspension time. Task-zone on-CPU duration
-sums the task's running time within the zone; thread-only zones have no task
-on-CPU sample. Zone statistics aggregate by source location across all threads.
+stack. Zone wall duration includes suspension time. Task-zone running duration
+sums the task's running time within the zone. Thread-only zones have no task
+running sample. Zone statistics aggregate by source location across all threads.
+Task-running time excludes coroutine suspension but includes OS waits and
+preemption. It is not physical CPU time.
 
 Task naming prefers an explicit user function, then the first non-runtime
 suspension-stack frame, then a spawn caller rendered as `spawned at file:line`,
 then the entry symbol, and finally a hexadecimal address. Executor main tasks
 are labelled `main (executor N)`. Runtime-frame filtering is heuristic: it skips
 `std`/`zio` namespaces, Zig `lib/std/`, and zio `src/` paths (including relative
-`src/` paths). Unusual source layouts or optimization can weaken attribution.
-Missing symbols do not prevent timeline or utilization analysis.
+`src/` paths). The analyzer checks enclosing DWARF inline contexts before it
+discards a physical frame as runtime code. Declaration files help runtime
+filtering but never replace missing call-site coordinates. Unusual source
+layouts or optimization can weaken attribution. Missing symbols do not prevent
+timeline or utilization analysis.
 
 Open `trace.json` in [Perfetto](https://ui.perfetto.dev/) or
-`chrome://tracing`. Each traced thread has its own track with task slices,
-poll/park/flush intervals, messages, plot counters, and thread-only zones.
-Task zones use nestable asynchronous slices keyed by task ID, so a begin on one
-thread can match an end on another without falsely occupying a single thread
-for the entire wall duration. `--flows` adds wake-to-run arrows; omit it for a
-less crowded timeline.
+`chrome://tracing`. The export retains the recorded process ID and executable name.
+Each thread has separate lanes for execution, states, parks, physical work, and
+wake points when present. Display thread IDs identify these derived lanes,
+not OS threads. Track metadata retains the trace thread index and lane name.
+Known thread labels include the OS thread ID and executor.
 
-The Perfetto JSON also contains `zioTrace.recordedClasses` (or `null` for missing
-process metadata) and a note about unavailable classes. Unclassified thread
-intervals remain explicitly named; absent categories do not imply zero activity.
+Task zones and inline blocking work use process-local asynchronous slices.
+Their IDs include the capture timestamp. Endpoints can cross threads without
+falsely occupying one physical thread for the full wall duration.
+Physical blocking work stays on its worker's work lane.
+
+`--flows` adds wake-to-run arrows with capture-scoped numeric bindings.
+Their endpoints are zero-duration slices at the recorded wake and run timestamps.
+Omit flows for a less crowded timeline.
+
+The Perfetto JSON includes `zioTrace.sessionPath`, `zioTrace.recordedClasses`,
+and `zioTrace.diagnostics`. SVG metadata also includes recording diagnostics.
+Visible warnings flag incomplete or damaged recordings in both formats.
+Unclassified intervals retain explicit labels. Absent classes do not imply zero activity.

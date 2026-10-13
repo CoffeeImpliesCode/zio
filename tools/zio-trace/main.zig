@@ -2,6 +2,7 @@ const std = @import("std");
 const Session = @import("session.zig").Session;
 const Model = @import("timeline.zig").Model;
 const Symbolizer = @import("symbolize.zig").Symbolizer;
+const report = @import("report.zig");
 
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
@@ -14,12 +15,15 @@ pub fn main(init: std.process.Init) !void {
         \\  -o PATH          Output file (required for util and perfetto).
         \\  --bins N         SVG time bins (default 300; 1..10000).
         \\  --flows          Include wake-to-run arrows in Perfetto.
+        \\  -h, --help       Show help without loading a session.
         \\
     ;
     var stdout_buffer: [8192]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &stdout_buffer);
     const w = &stdout.interface;
-    if (args.len < 2 or std.mem.eql(u8, args[1], "--help")) {
+    if (args.len < 2 or std.mem.eql(u8, args[1], "--help") or
+        std.mem.eql(u8, args[1], "-h"))
+    {
         try w.writeAll(usage);
         try w.flush();
         return;
@@ -36,6 +40,11 @@ pub fn main(init: std.process.Init) !void {
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            try w.writeAll(usage);
+            try w.flush();
+            return;
+        }
         if (std.mem.eql(u8, arg, "--flows")) {
             flows = true;
         } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--exe") or
@@ -64,15 +73,17 @@ pub fn main(init: std.process.Init) !void {
     const executable = exe orelse if (session.process) |process| process.exe_path else null;
     if (executable) |executable_path| {
         symbolizer = Symbolizer.init(init.gpa, io, executable_path, if (session.process) |process| process.anchor_addr else 0) catch |err| blk: {
-            std.log.warn("cannot symbolize {s}: {s}; using recorded addresses", .{ executable_path, @errorName(err) });
+            std.log.warn("cannot symbolize {f}: {s}; using recorded addresses", .{
+                report.Label{ .text = executable_path }, @errorName(err),
+            });
             break :blk null;
         };
     }
     try @import("naming.zig").resolve(a, &model, if (symbolizer) |*symbols| symbols else null);
     if (std.mem.eql(u8, command, "info")) {
-        try @import("report.zig").info(w, &model);
+        try report.info(w, &model);
     } else if (std.mem.eql(u8, command, "stats")) {
-        try @import("report.zig").stats(a, w, &model);
+        try report.stats(a, w, &model);
     } else {
         var file = try std.Io.Dir.cwd().createFile(io, output.?, .{});
         defer file.close(io);
@@ -80,12 +91,12 @@ pub fn main(init: std.process.Init) !void {
         var writer = file.writer(io, &buffer);
         if (std.mem.eql(u8, command, "util")) {
             try @import("svg.zig").write(a, &writer.interface, &model, bins);
-            try @import("report.zig").threadTable(w, &model);
+            try report.threadTable(w, &model);
         } else {
             try @import("perfetto.zig").write(a, &writer.interface, &model, flows);
         }
         try writer.interface.flush();
-        try w.print("Wrote {s}\n", .{output.?});
+        try w.print("Wrote {f}\n", .{report.Label{ .text = output.? }});
     }
     try w.flush();
 }

@@ -30,6 +30,8 @@ threadlocal var local_generation: u64 = 0;
 pub const Thread = struct {
     fd: std.c.fd_t,
     index: u64,
+    kind: format.ThreadKind = .other,
+    executor: u64 = format.no_executor,
     seq: u64 = 0,
     id_next: u64 = 0,
     id_end: u64 = 0,
@@ -298,6 +300,25 @@ pub inline fn getThread(kind: format.ThreadKind, executor: u64) ?*Thread {
     return registerThread(kind, executor, current_generation);
 }
 
+/// Preserve identity when a creator cannot allocate or open its trace producer.
+pub noinline fn unrecordedTaskId() u64 {
+    _ = dropped.fetchAdd(1, .monotonic);
+    return next_task_id.fetchAdd(1, .monotonic);
+}
+
+/// Register an explicit runtime role on the calling native thread.
+/// A changed role or executor identity closes the old trace-local lifetime first;
+/// repeated registration and generic emitters keep the current producer.
+pub noinline fn enterThread(kind: format.ThreadKind, executor: u64) ?*Thread {
+    const thread = getThread(kind, executor) orelse return null;
+    if (kind == .other) return thread;
+    if (thread.kind == kind and thread.executor == executor) return thread;
+    // Draining needs the writer, which acquires registry. Never hold it here.
+    local = null;
+    finishThread(thread);
+    return registerThread(kind, executor, local_generation);
+}
+
 noinline fn registerThread(kind: format.ThreadKind, executor: u64, current_generation: u64) ?*Thread {
     registry.lock();
     defer registry.unlock();
@@ -311,6 +332,8 @@ noinline fn registerThread(kind: format.ThreadKind, executor: u64, current_gener
     };
     thread.init(fd, index, stack.threadBounds());
     thread.classes = class_mask.load(.monotonic);
+    thread.kind = kind;
+    thread.executor = executor;
     threads.append(allocator, thread) catch {
         allocator.destroy(thread);
         _ = std.c.close(fd);
@@ -470,4 +493,435 @@ test "instrument task ids remain nonzero and unique across thread block rollover
             try std.testing.expect(!entry.found_existing);
         }
     }
+}
+
+const RoleTest = struct {
+    const c = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+        extern "c" fn fchdir(fd: std.c.fd_t) c_int;
+    };
+
+    fn openReader(fd: std.c.fd_t) !std.c.fd_t {
+        var name: [64]u8 = undefined;
+        const file = try std.mem.printSentinel(&name, "/proc/self/fd/{d}", .{fd}, 0);
+        const readable = std.c.open(file, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
+        if (readable < 0) return error.TraceReadOpenFailed;
+        return readable;
+    }
+
+    fn readThread(fd: std.c.fd_t, kind: format.ThreadKind, executor: u64, plots: usize, tasks: usize) !u64 {
+        const bytes = try std.testing.allocator.alloc(u8, 2 * 1024 * 1024);
+        defer std.testing.allocator.free(bytes);
+        const len = std.c.pread(fd, bytes.ptr, bytes.len, 0);
+        try std.testing.expect(len > 0);
+        var reader = try format.FileReader.init(bytes[0..@intCast(len)]);
+        const record = (try reader.next()) orelse return error.MissingThreadRecord;
+        try std.testing.expectEqual(format.RecordKind.thread, record.kind);
+        const metadata = try format.parseRecord(.thread, record.payload);
+        try std.testing.expectEqual(kind, metadata.kind);
+        try std.testing.expectEqual(executor, metadata.executor);
+        try std.testing.expectEqual(@as(u64, @intCast(std.Thread.getCurrentId())), metadata.os_tid);
+        var seq: u64 = 0;
+        var plot_count: usize = 0;
+        var task_count: usize = 0;
+        var began = false;
+        var ended = false;
+        while (try reader.next()) |raw| {
+            try std.testing.expectEqual(format.RecordKind.chunk, raw.kind);
+            const chunk = try format.parseChunk(raw.payload);
+            try std.testing.expectEqual(metadata.thread, chunk.header.thread);
+            try std.testing.expectEqual(seq, chunk.header.seq);
+            seq += 1;
+            var events = chunk.iterator();
+            while (try events.next()) |event| {
+                try std.testing.expect(!ended);
+                switch (event.event) {
+                    .thread_begin => {
+                        try std.testing.expect(!began);
+                        began = true;
+                    },
+                    .thread_end => {
+                        try std.testing.expect(began);
+                        ended = true;
+                    },
+                    .plot => |plot| {
+                        try std.testing.expect(began);
+                        try std.testing.expectEqualStrings("before registration", plot.name);
+                        try std.testing.expectEqual(@as(i64, @intCast(plot_count)), plot.value);
+                        plot_count += 1;
+                    },
+                    .task_begin => {
+                        try std.testing.expect(began);
+                        task_count += 1;
+                    },
+                    .executor_info => |info| {
+                        try std.testing.expectEqual(format.ThreadKind.executor, kind);
+                        try std.testing.expectEqual(executor, info.executor);
+                    },
+                    .flush_begin, .flush_end, .task_end => try std.testing.expect(began),
+                    else => return error.UnexpectedEvent,
+                }
+            }
+        }
+        try std.testing.expect(began and ended);
+        try std.testing.expectEqual(plots, plot_count);
+        try std.testing.expectEqual(tasks, task_count);
+        return metadata.thread;
+    }
+
+    fn promote(comptime kind: format.ThreadKind) !void {
+        if (builtin.os.tag != .linux) return error.SkipZigTest;
+        try std.testing.expectEqual(0, refs);
+        var scratch = std.testing.tmpDir(.{});
+        defer scratch.cleanup();
+        const cwd_fd = std.c.open(".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, @as(std.c.mode_t, 0));
+        try std.testing.expect(cwd_fd >= 0);
+        defer _ = std.c.close(cwd_fd);
+        try std.testing.expectEqual(0, c.fchdir(scratch.dir.handle));
+        defer std.debug.assert(c.fchdir(cwd_fd) == 0);
+        const previous = if (std.c.getenv("ZIO_PROFILE")) |value|
+            try std.testing.allocator.dupeSentinel(u8, std.mem.span(value), 0)
+        else
+            null;
+        defer {
+            if (previous) |value| {
+                std.debug.assert(c.setenv("ZIO_PROFILE", value, 1) == 0);
+                std.testing.allocator.free(value);
+            } else {
+                std.debug.assert(c.unsetenv("ZIO_PROFILE") == 0);
+            }
+        }
+        try std.testing.expectEqual(0, c.setenv("ZIO_PROFILE", "1", 1));
+        acquire();
+        defer release();
+        const before = getThread(.other, format.no_executor) orelse return error.MissingTraceThread;
+        const before_fd = try openReader(before.fd);
+        defer _ = std.c.close(before_fd);
+        for (0..10000) |i| {
+            before.emit(.plot, .{ .name = "before registration", .value = @intCast(i) });
+        }
+        const previous_id = before.nextTaskId();
+        const hooks = @import("hooks.zig");
+        var executor: struct {
+            id: u64,
+            instr: struct { thread: ?*Thread = null } = .{},
+        } = .{ .id = 17 };
+        const active = if (kind == .executor) blk: {
+            hooks.executorRegister(&executor);
+            break :blk executor.instr.thread orelse return error.MissingTraceThread;
+        } else blk: {
+            hooks.threadInit();
+            break :blk getThread(.other, format.no_executor) orelse return error.MissingTraceThread;
+        };
+        const active_fd = try openReader(active.fd);
+        defer _ = std.c.close(active_fd);
+        try std.testing.expectEqual(active, getThread(.other, format.no_executor).?);
+        try std.testing.expectEqual(active, enterThread(.other, format.no_executor).?);
+        if (kind == .executor) {
+            hooks.executorRegister(&executor);
+            try std.testing.expectEqual(active, executor.instr.thread.?);
+        } else {
+            hooks.threadInit();
+            try std.testing.expectEqual(active, getThread(.other, format.no_executor).?);
+        }
+        const task = active.nextTaskId();
+        try std.testing.expect(previous_id != task);
+        if (kind == .executor) {
+            active.emit(.executor_info, .{ .executor = executor.id, .loop = 99 });
+        }
+        active.emit(.task_begin, .{ .task = task });
+        active.emit(.task_end, .{ .reason = .finish });
+        const replacement = enterThread(.executor, 18) orelse return error.MissingTraceThread;
+        try std.testing.expect(replacement != active);
+        const replacement_fd = try openReader(replacement.fd);
+        defer _ = std.c.close(replacement_fd);
+        const replacement_task = replacement.nextTaskId();
+        try std.testing.expect(previous_id != replacement_task and task != replacement_task);
+        replacement.emit(.task_begin, .{ .task = replacement_task });
+        replacement.emit(.task_end, .{ .reason = .finish });
+        exitThread();
+        const before_index = try readThread(before_fd, .other, format.no_executor, 10000, 0);
+        const active_index = try readThread(
+            active_fd,
+            kind,
+            if (kind == .executor) executor.id else format.no_executor,
+            0,
+            1,
+        );
+        try std.testing.expect(before_index != active_index);
+        const replacement_index = try readThread(replacement_fd, .executor, 18, 0, 1);
+        try std.testing.expect(replacement_index != active_index);
+        const after_exit = getThread(.other, format.no_executor) orelse return error.MissingTraceThread;
+        try std.testing.expect(after_exit != replacement);
+        const after_exit_fd = try openReader(after_exit.fd);
+        defer _ = std.c.close(after_exit_fd);
+        const after_exit_task = after_exit.nextTaskId();
+        try std.testing.expect(after_exit_task != previous_id);
+        try std.testing.expect(after_exit_task != task);
+        try std.testing.expect(after_exit_task != replacement_task);
+        exitThread();
+        const after_exit_index = try readThread(after_exit_fd, .other, format.no_executor, 0, 0);
+        try std.testing.expect(after_exit_index != replacement_index);
+    }
+};
+
+test "instrument marker thread becomes a distinct executor lifetime" {
+    // Decode real files to preserve pre-registration markers without executor attribution.
+    try RoleTest.promote(.executor);
+    try RoleTest.promote(.executor);
+}
+
+test "instrument marker thread becomes a distinct blocking lifetime" {
+    // Explicit blocking registration must replace generic TLS, then survive generic emission.
+    try RoleTest.promote(.blocking);
+    try RoleTest.promote(.blocking);
+}
+
+const RegistrationFailureTest = struct {
+    const Context = struct {
+        runtime: *@import("../runtime.zig").Runtime,
+        completed: std.atomic.Value(u32) = .init(0),
+        failure: ?anyerror = null,
+    };
+
+    fn taskBody(context: *Context) void {
+        _ = context.completed.fetchAdd(1, .monotonic);
+    }
+
+    fn foreignSpawn(context: *Context) void {
+        var handle = context.runtime.spawn(taskBody, .{context}) catch |err| {
+            context.failure = err;
+            return;
+        };
+        handle.join();
+        handle.cancel();
+    }
+};
+
+// A creator can lose its trace file while an already-registered executor works.
+test "instrument failed creator registration preserves workload and task identity" {
+    if (builtin.os.tag != .linux or builtin.single_threaded or
+        !@import("root.zig").enabled) return error.SkipZigTest;
+    var scratch = std.testing.tmpDir(.{});
+    defer scratch.cleanup();
+    const cwd_fd = std.c.open(".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, @as(std.c.mode_t, 0));
+    try std.testing.expect(cwd_fd >= 0);
+    defer _ = std.c.close(cwd_fd);
+    try std.testing.expectEqual(0, RoleTest.c.fchdir(scratch.dir.handle));
+    defer std.debug.assert(RoleTest.c.fchdir(cwd_fd) == 0);
+    const runtime = try @import("../runtime.zig").Runtime.init(std.testing.allocator, .{
+        .executors = .exact(1),
+        .enable_main_executor = false,
+    });
+    var initialized = true;
+    defer if (initialized) runtime.deinit();
+    if (class_mask.load(.monotonic) & format.EventClass.sched.mask() == 0)
+        return error.SkipZigTest;
+    const worker = runtime.executors.items[0].instr.thread.?;
+    const worker_fd = try RoleTest.openReader(worker.fd);
+    defer _ = std.c.close(worker_fd);
+    const process_reader = try RoleTest.openReader(process_fd);
+    defer _ = std.c.close(process_reader);
+    var context: RegistrationFailureTest.Context = .{ .runtime = runtime };
+    {
+        var original: std.c.rlimit = undefined;
+        try std.testing.expectEqual(0, std.c.getrlimit(.NOFILE, &original));
+        const limited: std.c.rlimit = .{ .cur = @min(original.cur, 96), .max = original.max };
+        try std.testing.expectEqual(0, std.c.setrlimit(.NOFILE, &limited));
+        defer std.debug.assert(std.c.setrlimit(.NOFILE, &original) == 0);
+        var descriptors: [96]std.c.fd_t = undefined;
+        var count: usize = 0;
+        defer for (descriptors[0..count]) |fd| {
+            std.debug.assert(std.c.close(fd) == 0);
+        };
+        while (count < descriptors.len) {
+            const fd = std.c.dup(process_fd);
+            if (fd < 0) {
+                try std.testing.expectEqual(std.posix.E.MFILE, std.posix.errno(fd));
+                break;
+            }
+            descriptors[count] = fd;
+            count += 1;
+        }
+        try std.testing.expect(count < descriptors.len);
+        const foreign = try std.Thread.spawn(.{}, RegistrationFailureTest.foreignSpawn, .{&context});
+        foreign.join();
+    }
+    if (context.failure) |err| return err;
+    try std.testing.expectEqual(@as(u32, 1), context.completed.load(.monotonic));
+    runtime.deinit();
+    initialized = false;
+    var bytes: [65536]u8 = undefined;
+    const length = std.c.pread(worker_fd, &bytes, bytes.len, 0);
+    try std.testing.expect(length > 0);
+    var reader = try format.FileReader.init(bytes[0..@intCast(length)]);
+    var current: u64 = 0;
+    var finishes: usize = 0;
+    while (try reader.next()) |record| {
+        if (record.kind != .chunk) continue;
+        var events = (try format.parseChunk(record.payload)).iterator();
+        while (try events.next()) |event| switch (event.event) {
+            .task_begin => |v| {
+                try std.testing.expect(v.task != 0);
+                try std.testing.expectEqual(@as(u64, 0), current);
+                current = v.task;
+            },
+            .task_end => |v| {
+                try std.testing.expect(current != 0);
+                if (v.reason == .finish) finishes += 1;
+                current = 0;
+            },
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(u64, 0), current);
+    try std.testing.expectEqual(@as(usize, 1), finishes);
+    const process_length = std.c.pread(process_reader, &bytes, bytes.len, 0);
+    try std.testing.expect(process_length > 0);
+    reader = try format.FileReader.init(bytes[0..@intCast(process_length)]);
+    var losses: ?u64 = null;
+    while (try reader.next()) |record| {
+        if (record.kind == .end) losses = (try format.parseRecord(.end, record.payload)).dropped;
+    }
+    try std.testing.expect(losses.? > 0);
+}
+
+const TimerTraceTest = struct {
+    const Loop = @import("../ev/loop.zig").Loop;
+    const Timer = @import("../ev/completion.zig").Timer;
+    const cycles = 64;
+    const Context = struct {
+        loop: *Loop,
+        tid: u64 = 0,
+        reader: std.c.fd_t = -1,
+        failure: ?anyerror = null,
+    };
+
+    fn run(context: *Context) void {
+        exercise(context) catch |err| {
+            context.failure = err;
+        };
+    }
+
+    fn exercise(context: *Context) !void {
+        context.tid = @intCast(std.Thread.getCurrentId());
+        const producer = getThread(.other, format.no_executor) orelse return error.MissingTraceThread;
+        defer exitThread();
+        context.reader = try RoleTest.openReader(producer.fd);
+        var timer: Timer = .init(.{ .duration = .fromSeconds(60) });
+        for (0..cycles) |_| {
+            context.loop.setTimer(&timer, .{ .duration = .fromSeconds(60) });
+            context.loop.setTimer(&timer, .{ .duration = .fromSeconds(30) });
+            if (!context.loop.clearTimer(&timer)) return error.TimerNotDisarmed;
+            // Clearing an already-disarmed timer must not emit a second terminal event.
+            if (!context.loop.clearTimer(&timer)) return error.TimerNotReusable;
+        }
+    }
+
+    fn verify(context: Context) !void {
+        var bytes: [65536]u8 = undefined;
+        const length = std.c.pread(context.reader, &bytes, bytes.len, 0);
+        try std.testing.expect(length > 0);
+        var reader = try format.FileReader.init(bytes[0..@intCast(length)]);
+        const metadata = try format.parseRecord(.thread, (try reader.next()).?.payload);
+        try std.testing.expectEqual(context.tid, metadata.os_tid);
+        var submits: usize = 0;
+        var completes: usize = 0;
+        while (try reader.next()) |record| {
+            if (record.kind != .chunk) continue;
+            var events = (try format.parseChunk(record.payload)).iterator();
+            while (try events.next()) |event| switch (event.event) {
+                .io_submit => |value| {
+                    try std.testing.expectEqual(@as(u64, @backingInt(@import("../ev/completion.zig").Op.timer)), value.kind);
+                    submits += 1;
+                },
+                .io_complete => |value| {
+                    try std.testing.expectEqual(format.IoResult.canceled, value.result);
+                    completes += 1;
+                },
+                else => {},
+            };
+        }
+        try std.testing.expectEqual(@as(usize, cycles), submits);
+        try std.testing.expectEqual(@as(usize, cycles), completes);
+    }
+
+    fn verifyRetired(fd: std.c.fd_t) !void {
+        var bytes: [65536]u8 = undefined;
+        const length = std.c.pread(fd, &bytes, bytes.len, 0);
+        try std.testing.expect(length > 0);
+        var reader = try format.FileReader.init(bytes[0..@intCast(length)]);
+        var pending: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer pending.deinit(std.testing.allocator);
+        while (try reader.next()) |record| {
+            if (record.kind != .chunk) continue;
+            var events = (try format.parseChunk(record.payload)).iterator();
+            while (try events.next()) |event| switch (event.event) {
+                .io_submit => |value| {
+                    try std.testing.expect(!pending.contains(value.op));
+                    try pending.put(std.testing.allocator, value.op, {});
+                },
+                .io_complete => |value| try std.testing.expect(pending.remove(value.op)),
+                else => {},
+            };
+        }
+        try std.testing.expectEqual(@as(usize, 0), pending.count());
+    }
+};
+
+test "instrument cross-thread timer disarms retain producer ownership and terminal events" {
+    if (builtin.os.tag != .linux or builtin.single_threaded or
+        !@import("root.zig").enabled) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const scratch = std.mem.span(std.c.getenv("TMPDIR") orelse return error.MissingScratchDirectory);
+    var random: [8]u8 = undefined;
+    io.random(&random);
+    const directory = try a.print("{s}/zio-trace-timers-{s}", .{ scratch, std.fmt.bytesToHex(&random, .lower) });
+    var dir = try std.Io.Dir.cwd().createDirPathOpen(io, directory, .{});
+    defer std.Io.Dir.cwd().deleteTree(io, directory) catch {};
+    defer dir.close(io);
+    const cwd_fd = std.c.open(".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, @as(std.c.mode_t, 0));
+    try std.testing.expect(cwd_fd >= 0);
+    defer _ = std.c.close(cwd_fd);
+    try std.testing.expectEqual(0, RoleTest.c.fchdir(dir.handle));
+    defer std.debug.assert(RoleTest.c.fchdir(cwd_fd) == 0);
+    const previous = if (std.c.getenv("ZIO_PROFILE")) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
+    defer {
+        if (previous) |value| {
+            std.debug.assert(RoleTest.c.setenv("ZIO_PROFILE", value, 1) == 0);
+        } else std.debug.assert(RoleTest.c.unsetenv("ZIO_PROFILE") == 0);
+    }
+    try std.testing.expectEqual(0, RoleTest.c.setenv("ZIO_PROFILE", "io", 1));
+    const runtime = try @import("../runtime.zig").Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    var initialized = true;
+    defer if (initialized) runtime.deinit();
+    const main_reader = try RoleTest.openReader(runtime.executors.items[0].instr.thread.?.fd);
+    defer _ = std.c.close(main_reader);
+    var contexts = [_]TimerTraceTest.Context{
+        .{ .loop = &runtime.executors.items[0].loop },
+        .{ .loop = &runtime.executors.items[0].loop },
+    };
+    defer for (contexts) |context| {
+        if (context.reader >= 0) _ = std.c.close(context.reader);
+    };
+    var workers: [2]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer for (workers[0..spawned]) |worker| worker.join();
+    for (&contexts) |*context| {
+        workers[spawned] = try std.Thread.spawn(.{}, TimerTraceTest.run, .{context});
+        spawned += 1;
+    }
+    for (workers) |worker| worker.join();
+    spawned = 0;
+    for (contexts) |context| {
+        if (context.failure) |err| return err;
+        try TimerTraceTest.verify(context);
+    }
+    runtime.deinit();
+    initialized = false;
+    try TimerTraceTest.verifyRetired(main_reader);
 }

@@ -332,7 +332,7 @@ pub const LoopState = struct {
     }
 
     pub fn finishCompletion(self: *LoopState, completion: *Completion) void {
-        @import("../instrument/root.zig").ioComplete(self.loop, completion);
+        @import("../instrument/root.zig").ioComplete(completion);
         completion.enterDead();
 
         // Both callbacks below can free `completion`, so whichever may free it must
@@ -662,7 +662,7 @@ pub const Loop = struct {
             timer.c.err = null;
             timer.c.setLoop(self);
             _ = timer.c.enterRunning();
-            @import("../instrument/root.zig").ioSubmit(self, &timer.c);
+            @import("../instrument/root.zig").ioSubmit(&timer.c);
         }
         self.state.armTimer(timer);
     }
@@ -692,6 +692,7 @@ pub const Loop = struct {
         // sitting in this loop's cancel queue); it owns the finish dispatch.
         if (!timer.c.tryDisarm()) return false;
         self.state.disarmTimer(timer);
+        @import("../instrument/root.zig").ioDiscard(&timer.c);
         return true;
     }
 
@@ -876,7 +877,7 @@ pub const Loop = struct {
     }
 
     fn addInternal(self: *Loop, completion: *Completion) void {
-        @import("../instrument/root.zig").ioSubmit(self, completion);
+        @import("../instrument/root.zig").ioSubmit(completion);
         completion.setLoop(self);
         const old = completion.enterRunning();
         if (old.phase == .dead) {

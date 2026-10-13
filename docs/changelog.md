@@ -38,6 +38,37 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Fixed I/O trace events using another thread's producer buffer. Timer disarms
+  and executor shutdown now record terminal cancellations. Latency reports
+  separate completed, failed, and canceled/disarmed operations.
+
+- Fixed nested blocking jobs double-counting worker occupancy and migrated inline
+  work appearing to occupy the original executor for its full wall duration.
+
+- Trace analysis now rejects foreign-session files and retains events without
+  thread metadata. All output formats report recording damage and distinguish
+  final dropped counts from lower bounds.
+
+- Fixed Perfetto wake bindings, process identity, asynchronous capture IDs, and
+  overlapping state intervals. Wake endpoints no longer appear as unfinished spans.
+
+- Trace text reports escape control characters and invalid UTF-8 labels.
+  Command help no longer requires a recording or output path.
+
+- Fixed nested inline blocking work losing its parent task identity, including
+  after suspension, cancellation, and executor migration.
+
+- Fixed threads that first emit user markers retaining an external-thread role
+  after they enter an executor or blocking worker.
+
+- Fixed task naming that discarded enclosing user functions behind runtime
+  DWARF inline frames. Missing call-site coordinates no longer use declaration
+  lines. The analyzer caches compilation-unit metadata and rejects cyclic
+  origin references.
+
+- Trace registration failure no longer aborts a workload or assigns task ID zero.
+  Zone statistics now label elapsed task execution as task-running time, not CPU time.
+
 - Sockets accepted with the io_uring backend were blocking and leaked into child processes,
   and on Windows a socket bound before `connect` failed to connect.
 

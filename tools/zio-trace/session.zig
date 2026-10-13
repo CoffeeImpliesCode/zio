@@ -57,6 +57,8 @@ pub const Session = struct {
     events: std.ArrayList(Event) = .empty,
     clock: Clock = .{},
     dropped: u64 = 0,
+    finalized: bool = false,
+    header_mismatches: usize = 0,
     decode_errors: usize = 0,
     sequence_errors: usize = 0,
     files: usize = 0,
@@ -76,18 +78,31 @@ pub const Session = struct {
         defer dir.close(io);
         var self: Session = .{ .path = path };
         var header_set = false;
+        var files: std.ArrayList([]const u8) = .empty;
         var it = dir.iterate();
         while (try it.next(io)) |entry| {
-            if (!std.mem.endsWith(u8, entry.name, ".dump")) continue;
-            const bytes = try dir.readFileAlloc(io, entry.name, a, .unlimited);
+            if (std.mem.endsWith(u8, entry.name, ".dump"))
+                try files.append(a, try a.dupe(u8, entry.name));
+        }
+        // The process header is authoritative, independent of directory order.
+        std.mem.sort([]const u8, files.items, {}, fileLess);
+        for (files.items) |file| {
+            const bytes = try dir.readFileAlloc(io, file, a, .unlimited);
             self.files += 1;
             var reader = format.FileReader.init(bytes) catch {
                 self.decode_errors += 1;
                 continue;
             };
-            if (!header_set or std.mem.eql(u8, entry.name, "process.dump")) {
+            if (!header_set) {
                 self.header = reader.header;
                 header_set = true;
+            } else if (reader.header.pid != self.header.pid or
+                reader.header.start_realtime_ns != self.header.start_realtime_ns or
+                reader.header.clock != self.header.clock or
+                reader.header.ticks_per_second != self.header.ticks_per_second)
+            {
+                self.header_mismatches += 1;
+                continue;
             }
             while (true) {
                 const record = (reader.next() catch {
@@ -147,9 +162,19 @@ pub const Session = struct {
                 if (name.table == .io_op) try self.names.put(a, name.value, name.name);
             },
             .chunk => try self.chunks.append(a, .{ .view = try format.parseChunk(raw.payload) }),
-            .end => self.dropped +|= (try format.parseRecord(.end, raw.payload)).dropped,
+            .end => {
+                const end = try format.parseRecord(.end, raw.payload);
+                self.dropped = @max(self.dropped, end.dropped);
+                self.finalized = true;
+            },
             _ => {},
         }
+    }
+
+    fn fileLess(_: void, lhs: []const u8, rhs: []const u8) bool {
+        if (std.mem.eql(u8, lhs, "process.dump")) return !std.mem.eql(u8, rhs, "process.dump");
+        if (std.mem.eql(u8, rhs, "process.dump")) return false;
+        return std.mem.order(u8, lhs, rhs) == .lt;
     }
 
     fn chunkLess(_: void, lhs: Chunk, rhs: Chunk) bool {

@@ -186,7 +186,7 @@ pub const record = struct {
     };
 
     pub const End = struct {
-        /// Events dropped across all threads (buffer limit reached).
+        /// Trace losses across all threads, including failed producer registration.
         dropped: u64,
     };
 };

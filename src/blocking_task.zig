@@ -22,7 +22,7 @@ pub const AnyBlockingTask = struct {
     work: ev.Work,
     runtime: *Runtime,
     closure: Closure,
-    instr: @import("instrument/root.zig").TaskData = .{},
+    instr: @import("instrument/root.zig").BlockingTaskData = .{},
 
     /// Bound by the pool worker around the task's function (via
     /// `work.cancel_token`), so a `SIGURG` from `cancel()` can interrupt a
@@ -141,8 +141,8 @@ pub const AnyBlockingTask = struct {
 // Work function for blocking tasks - runs in thread pool
 fn workFunc(work: *ev.Work) void {
     const task: *AnyBlockingTask = @ptrCast(@alignCast(work.userdata.?));
-    @import("instrument/root.zig").begin(task);
-    defer @import("instrument/root.zig").end(task, .finish);
+    const trace_scope = @import("instrument/root.zig").blockingBegin(task);
+    defer trace_scope.end();
 
     // Execute the user's blocking function. Token-bearing work always runs; a
     // cancellation is delivered by SIGURG interrupting a cancelable syscall (or

@@ -17,16 +17,20 @@ fn taskName(a: std.mem.Allocator, task: Task, symbolizer: ?*Symbolizer) ![]const
             var it = frames.iterator();
             while (try it.next()) |address| {
                 if (address == 0) continue;
-                if (symbols.lookup(address - 1)) |loc| if (!runtimeFrame(loc)) return loc.function;
+                for (symbols.lookupFrames(address - 1)) |loc| {
+                    if (!runtimeFrame(loc)) return loc.function;
+                }
             }
         }
         if (task.spawn_stack) |frames| {
             var it = frames.iterator();
             while (try it.next()) |address| {
                 if (address == 0) continue;
-                if (symbols.lookup(address - 1)) |loc| {
+                for (symbols.lookupFrames(address - 1)) |loc| {
                     if (runtimeFrame(loc)) continue;
-                    if (loc.file) |file| return a.print("spawned at {s}:{d}", .{ file, loc.line });
+                    if (loc.line != 0) {
+                        if (loc.file) |file| return a.print("spawned at {s}:{d}", .{ file, loc.line });
+                    }
                 }
             }
         }
@@ -37,13 +41,16 @@ fn taskName(a: std.mem.Allocator, task: Task, symbolizer: ?*Symbolizer) ![]const
 
 pub fn runtimeFrame(loc: Location) bool {
     if (std.mem.startsWith(u8, loc.function, "std.") or std.mem.startsWith(u8, loc.function, "zio.") or std.mem.startsWith(u8, loc.function, "zio::") or std.mem.startsWith(u8, loc.function, "std::")) return true;
-    if (loc.file) |file| {
-        if (std.mem.indexOf(u8, file, "/lib/std/") != null or std.mem.startsWith(u8, file, "lib/std/")) return true;
-        if (std.mem.indexOf(u8, file, "/zio/src/") != null) return true;
-        // DWARF commonly stores paths relative to the zio build root.
-        if (std.mem.startsWith(u8, file, "src/")) return true;
-    }
+    if (loc.file) |file| if (runtimeSource(file)) return true;
+    if (loc.provenance_file) |file| if (runtimeSource(file)) return true;
     return false;
+}
+
+fn runtimeSource(file: []const u8) bool {
+    if (std.mem.indexOf(u8, file, "/lib/std/") != null or std.mem.startsWith(u8, file, "lib/std/")) return true;
+    if (std.mem.indexOf(u8, file, "/zio/src/") != null) return true;
+    // DWARF commonly stores paths relative to the zio build root.
+    return std.mem.startsWith(u8, file, "src/");
 }
 
 test "runtime frame naming heuristic" {

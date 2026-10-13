@@ -4,8 +4,27 @@ const format = @import("format.zig");
 const session = @import("session.zig");
 const hooks = @import("hooks.zig");
 pub const enabled = @import("../options.zig").options.instrument;
-pub const TaskData = if (enabled) struct { id: u64 = 0, needs_stack: bool = false } else struct {};
+pub const TaskData = if (enabled) struct {
+    id: u64 = 0,
+    // Wake notifications can read this while an inline blocking scope changes.
+    running_id: std.atomic.Value(u64) = .init(0),
+    needs_stack: bool = false,
+} else struct {};
+pub const BlockingTaskData = if (enabled) struct {
+    id: u64 = 0,
+    needs_stack: bool = false,
+} else struct {};
 pub const ThreadData = if (enabled) struct { thread: ?*session.Thread = null } else struct {};
+
+pub const BlockingScope = struct {
+    data: if (enabled) hooks.BlockingScopeData else void = if (enabled) .{} else {},
+
+    pub inline fn end(self: BlockingScope) void {
+        if (comptime !enabled) return;
+        if (self.data.task == 0) return;
+        hooks.blockingEnd(self.data);
+    }
+};
 
 pub inline fn active() bool {
     if (comptime !enabled) return false;
@@ -129,13 +148,13 @@ pub inline fn parkBegin(executor: anytype, duration: anytype) void {
     }
     hooks.parkBegin(executor, duration);
 }
-pub inline fn begin(task: anytype) void {
-    if (comptime !enabled) return;
+pub inline fn blockingBegin(task: anytype) BlockingScope {
+    if (comptime !enabled) return .{};
     if (!selected(.task_begin)) {
         @branchHint(.likely);
-        return;
+        return .{};
     }
-    hooks.begin(task);
+    return .{ .data = hooks.blockingBegin(task) };
 }
 pub inline fn beginOn(executor: anytype, task: anytype) void {
     if (comptime !enabled) return;
@@ -144,14 +163,6 @@ pub inline fn beginOn(executor: anytype, task: anytype) void {
         return;
     }
     hooks.beginOn(executor, task);
-}
-pub inline fn end(task: anytype, reason: format.TaskEndReason) void {
-    if (comptime !enabled) return;
-    if (!selected(.task_end)) {
-        @branchHint(.likely);
-        return;
-    }
-    hooks.end(task, reason);
 }
 pub inline fn endOn(executor: anytype, task: anytype, reason: format.TaskEndReason) void {
     if (comptime !enabled) return;
@@ -209,21 +220,29 @@ pub inline fn pollEnd(loop: anytype, should_poll: bool, timed_out: bool) void {
     }
     hooks.pollEnd(loop, should_poll, timed_out);
 }
-pub inline fn ioSubmit(loop: anytype, completion: anytype) void {
+pub inline fn ioSubmit(completion: anytype) void {
     if (comptime !enabled) return;
     if (!selected(.io_submit)) {
         @branchHint(.likely);
         return;
     }
-    hooks.ioSubmit(loop, completion);
+    hooks.ioSubmit(completion);
 }
-pub inline fn ioComplete(loop: anytype, completion: anytype) void {
+pub inline fn ioComplete(completion: anytype) void {
     if (comptime !enabled) return;
     if (!selected(.io_complete)) {
         @branchHint(.likely);
         return;
     }
-    hooks.ioComplete(loop, completion);
+    hooks.ioComplete(completion);
+}
+pub inline fn ioDiscard(completion: anytype) void {
+    if (comptime !enabled) return;
+    if (!selected(.io_complete)) {
+        @branchHint(.likely);
+        return;
+    }
+    hooks.ioDiscard(completion);
 }
 pub inline fn loopWake(loop: anytype, issued: bool) void {
     if (comptime !enabled) return;
