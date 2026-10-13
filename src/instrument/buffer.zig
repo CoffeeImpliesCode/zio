@@ -30,7 +30,7 @@ test "instrument buffer rollover remains independently decodable and contiguous"
 
 pub const Buffer = struct {
     pub const capacity = 64 * 1024;
-    const reserve = 3 * format.max_uleb_len;
+    const reserve = 3 * format.max_varint_len;
     bytes: [capacity]u8 = undefined,
     len: usize = reserve,
     base: u64 = 0,

@@ -63,6 +63,14 @@ pub const Session = struct {
     start_ns: f64 = 0,
     end_ns: f64 = 0,
 
+    pub fn classMask(self: Session) ?u64 {
+        return if (self.process) |process| process.classes else null;
+    }
+
+    pub fn hasClass(self: Session, class: format.EventClass) bool {
+        return if (self.classMask()) |mask| mask & class.mask() != 0 else false;
+    }
+
     pub fn load(a: std.mem.Allocator, io: std.Io, path: []const u8) !Session {
         var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
         defer dir.close(io);

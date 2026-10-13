@@ -4,16 +4,39 @@ Build with `zig build examples -Dinstrument=true`. The default is `false`: hooks
 per-task trace data are compile-time eliminated. A root module can also set
 `pub const zio_options: zio.Options = .{ .instrument = true };`.
 
-Tracing starts when the first runtime is initialized, only when `ZIO_PROFILE=1`.
-Unset, empty, or any other value leaves the tracing session inactive: no output,
-writer thread, or buffers are created. The last runtime's `deinit` drains the
-writer, closes files, and records the session end. Join external threads that use
-instrumentation before deinitializing the last runtime.
+Tracing starts when the first runtime is initialized. `ZIO_PROFILE=1` records all
+event classes; `ZIO_PROFILE=sched,loop` records only selected classes. Unset,
+empty, or a list without valid classes stays inactive: no files, writer, or
+buffers are created. Unknown names produce a warning and are ignored. The last
+runtime's `deinit` drains the writer and closes the session. Join external threads
+that use instrumentation before deinitializing the last runtime.
 
 ```sh
 zig build examples -Dexample=trace-demo -Dinstrument=true
 ZIO_PROFILE=1 ./zig-out/bin/trace-demo
+ZIO_PROFILE=sched,loop ./zig-out/bin/trace-demo
 ```
+
+## Event classes
+
+Use comma-separated names (surrounding whitespace is ignored):
+
+| Class | Records |
+| --- | --- |
+| `sched` | Task lifecycle/functions, executor identity, parks and steals |
+| `loop` | Backend polls and loop wake syscalls |
+| `io` | Completion submit/complete |
+| `work` | Blocking work queue/begin/end |
+| `stacks` | Unknown-function spawn and first-suspend stacks |
+| `user` | Source locations, zones, messages and plots |
+
+Thread lifetime, flush, dropped-event and process records are always present in
+an active session. The process record stores the selected mask, so omitted
+categories mean **not recorded**, not zero activity. Stacks are captured only
+when `stacks` is selected and the user function is unknown. With stacks disabled,
+generic `std.Io` tasks can retain wrapper names; native function addresses still
+provide attribution when `sched` is selected. A marker-only or stacks-only
+session has no scheduler intervals for correlating task migration.
 
 ## Output layout
 
@@ -24,28 +47,32 @@ files are 0600. Trace messages, paths, and user labels can contain private data.
 The trace-local index prevents OS thread-id reuse from merging threads.
 
 The process file records the executable path, runtime address of
-`zio_trace_anchor`, operation names, clock calibration, and final dropped count.
+`zio_trace_anchor`, selected classes, operation names, clock calibration, and final dropped count.
 Thread files record thread kind, executor identity, and independently decodable,
 consecutively numbered chunks. Executors and blocking-pool workers flush on exit;
 other threads flush at session end. File I/O is raw OS I/O, never zio I/O.
 
 ## Events and protocol
 
-`src/instrument/format.zig` defines version 1 of the binary protocol and provides
-`FileReader`, `parseChunk`, and `EventIterator`. Files start with a 40-byte
-`ZIOTRACE` header. Records carry a kind byte, ULEB128 payload length, and payload.
-Chunks carry thread index, sequence number, base timestamp, then events with a
-kind byte and timestamp delta. Integers use ULEB128; signed values use zigzag.
+`src/instrument/format.zig` defines version 2 of the binary protocol and provides
+`FileReader`, `parseChunk`, and `EventIterator`. Version 1 is not accepted by the
+v2 reader. Files start with a 40-byte `ZIOTRACE` header. Records carry a kind byte,
+varint payload length, and payload. Chunks carry thread index, sequence number,
+base timestamp, then events with a kind byte and timestamp delta. Unsigned
+integers use unsigned LEB128; signed values use zigzag.
 Strings are length-prefixed bytes, not NUL-terminated. Unknown records can be
 skipped; unknown events terminate decoding of their chunk. A crash can leave a
 truncated final record; earlier complete records remain readable.
 
 `task_begin` and `task_end` delimit actual coroutine execution, including direct
-coroutine-to-coroutine switches. End reasons distinguish runnable yield, waiting,
-and completion. Main-task execution is recorded separately from scheduler work;
-worker executors do not execute their synthetic main task. Task ids are unique
-within a session and remain unchanged during migration. Creation records carry
-parent and group identity; wake records identify the emitting thread.
+coroutine-to-coroutine switches. In v2, an end carries only its reason and closes
+the latest begin on that thread. Reasons distinguish runnable yield, waiting,
+and completion. Main-task execution is separate from scheduler work; worker
+executors do not execute their synthetic main task. Nonzero task ids are
+session-unique and remain unchanged during migration. Threads reserve blocks of
+1,024 ids from a global counter, then assign locally; ordinary ids need only
+one to three varint bytes. Creation carries parent/group identity; wakes identify
+the emitting thread.
 
 Park events enclose executor idle handling. Poll events enclose only backend
 polls, not callback dispatch: timeout zero means a nonblocking check; the maximum
@@ -58,10 +85,10 @@ source-location definition preceding first use on each thread. Plots use signed
 
 ## Function attribution
 
-Native spawn wrappers emit the user function address. Creation also captures a
-bounded spawn-side stack. The first suspension captures return addresses from
-the coroutine's own frame-pointer chain, bounded by its stack allocation. These
-stacks expose user callers of generic `std.Io` async/concurrent wrappers. Stack
+Native spawn wrappers record the user function address and skip stack capture.
+Only unknown user functions (such as generic `std.Io` async/concurrent/group
+wrappers) get a bounded spawn-side stack and a first-suspension frame-pointer
+stack. Main tasks need neither. Stack
 attribution in release builds requires frame pointers on both the executable
 and zio modules: set `.omit_frame_pointer = false` in their module options (or
 assign `exe.root_module.omit_frame_pointer = false` and
@@ -94,12 +121,14 @@ no-ops when compiled out or inactive.
 The active fast path reads the hardware counter (RDTSC on x86_64, CNTVCT on
 AArch64; monotonic nanoseconds otherwise) and encodes into a thread-local 64 KiB
 buffer. Each registered thread owns two buffers. Full chunks are handed to one
-background writer. Public hooks inline only a likely-inactive flag check; active
-encoding and stack capture are out-of-line. Slice-free events encode in one pass,
+background writer. Public event hooks inline one monotonic class-mask load and
+bit test; active encoding and stack capture are out-of-line. Executor/loop hooks
+use cached thread pointers, avoiding TLS and generation lookup. Other-thread
+hooks use a generation-checked TLS cache. Slice-free events encode in one pass,
 using a compile-time size bound; strings/stacks use an exact-length check.
-Apart from active/generation loads, ordinary events need no lock or atomic.
-Rollover uses an atomic handoff. The writer blocks on a futex until a chunk or
-shutdown notification, with a calibration timeout of about one second.
+Most events need no lock. ID-block reservation and rollover use atomic handoffs.
+The writer blocks on a futex until a chunk or shutdown notification, with a
+calibration timeout of about one second.
 Producers wait on their own buffer's futex if the spare is still in use; those
 waits have flush brackets. Registration, source definitions, stack capture, and
 lifecycle management are intentionally slower control paths. Thread-begin/end
@@ -108,30 +137,66 @@ Calibration pairs ticks with monotonic time at start, approximately once a
 second, and at end. Profiling writes real data and perturbs the measured program:
 compare inactive and active ReleaseFast builds for the actual workload and disk.
 
-For one x86_64 Linux ReleaseFast sample, two tasks each yielded 2,000,000 times on
-one executor. Five interleaved runs per mode, pinned to two physical cores on one
-socket (one available for the writer), produced these times. The timing region
-ends before final runtime teardown:
+The following x86_64 Linux ReleaseFast measurements used frame pointers and
+`taskset -c 2,4` (two physical cores on one socket, one available for the writer).
+The switch workload has two tasks each yielding 2,000,000 times on one executor;
+the spawn workload creates 200,000 no-op tasks in groups of 100. Each step had
+five interleaved runs per mode against preserved baseline binaries. Values are
+medians in nanoseconds; CPU contention varied between rounds, so compare each
+step with its contemporary baseline, not with another row.
 
-| Build / environment | Minimum ns/yield-switch | Median ns/yield-switch |
+| Cumulative change | Switch baseline / changed | Spawn baseline / changed |
 | --- | ---: | ---: |
-| `instrument=false` | 47.04 | 47.28 |
-| `instrument=true`, `ZIO_PROFILE` unset | 48.79 | 49.10 |
-| `instrument=true`, `ZIO_PROFILE=1` | 115.85 | 129.37 |
+| Unknown-function-only stacks; v2 implicit task ends | 90.89 / 110.99 | 926.51 / 732.90 |
+| Dense task-ID blocks | 132.33 / 105.55 | 882.09 / 668.10 |
+| Executor/loop thread caches | 135.84 / 107.43 | 664.13 / 466.78 |
+| Class-mask gates (final) | 133.35 / 111.80 | 925.20 / 691.08 |
 
-Inactive tracing added 1.83 ns/switch at the medians. Compared with the previous
-inline/pre-sized encoder, median tracing-added cost fell from 62.45 to 40.13
-ns/event (subtract the inactive baseline, then divide by two task events per
-switch). Total active cost, including the runtime, fell from 91.86 to 64.69
-ns/event. The preserved previous binary used 500,000 yields per task; all values
-are normalized by its switch count.
+The integrated comparison used seven interleaved runs per mode, with the same
+workloads, compiler flags, and CPU affinity. No runs were excluded. Timed regions
+exclude runtime setup and shutdown. Runs had large spreads on this shared host.
+Dump sizes are median totals in decimal MB:
 
-The median active trace recorded 8,000,033 events in 517.693 ms of trace wall
-time: 15.45 million events/s and 123.67 MB/s of dumps (decimal MB). Dump size was
-64,022,997 bytes, with no drops or decode errors. Perf samples placed most tracing
-cycles in task begin/end hooks; timestamp reads and remaining LEB128 stores/loops
-dominate their active work. These are sample measurements, not a portable
-overhead guarantee: scheduler, CPU contention, and storage matter.
+| Build / environment | ns/switch | ns/spawn | Switch dumps MB | Spawn dumps MB |
+| --- | ---: | ---: | ---: | ---: |
+| Preserved compiled-out baseline | 57.13 | 477.78 | — | — |
+| Current compiled-out | 59.41 | 468.40 | — | — |
+| Preserved tracing, profile unset | 51.36 | 466.95 | — | — |
+| Current tracing, profile unset | 60.67 | 535.72 | — | — |
+| Preserved tracing, profile `1` | 136.44 | 1025.81 | 63.24 | 17.47 |
+| Current tracing, profile `1` | 115.10 | 698.04 | 26.19 | 8.67 |
+| Current tracing, profile `sched,loop` | 118.12 | 721.89 | 26.12 | 8.69 |
+
+Active switches improved 15.6% and spawns improved 32.0% against the preserved
+tracing baseline. Inactive switches increased 9.31 ns and spawns increased
+68.77 ns. Code generation no longer inlined `switchOut` into the yield loop.
+A hook-local cold-branch hint did not restore inlining, so it was removed.
+These changes are a measured trade-off, not a zero-overhead claim.
+
+Strict decoding of retained benchmark recordings found no drops, sequence,
+thread-lifetime, task-pairing, class-selection, or known-function stack errors.
+The demo used 10,464 bytes with `sched,loop`, versus 14,441 bytes with all classes.
+Thread interleavings also affect these sizes. With all classes, only the three
+unknown-function tasks had spawn and first-suspend stacks.
+
+### Varint experiment
+
+LEB128 remains the wire codec. A prefix alternative used one unaligned eight-byte
+store for the common form, with a nine-byte form above 56 bits. Short output
+slices used a bounded copy. Neither codec needed extra buffer slack.
+
+Seven interleaved ReleaseFast runs used `taskset -c 6,8`. The mixed v2 workload
+contained 50% task begins, 30% task ends, 10% wakes, 5% I/O submissions, and 5%
+16-frame stacks. The runtime comparison used frozen revision `7a97c388` with
+v1 event layouts, not the integrated v2 runtime:
+
+| Codec | Mixed encode ns/event | Mixed decode ns/event | Active ns/switch | Active ns/spawn |
+| --- | ---: | ---: | ---: | ---: |
+| LEB128 | 18.68 | 30.91 | 84.03 | 594.78 |
+| Prefix | 20.56 | 19.31 | 113.36 | 667.67 |
+
+Prefix reduced decode time but increased common-event encode time. The frozen
+runtime runs were also slower. The rejected codec was removed.
 
 ## Analyzing a trace
 
@@ -158,14 +223,32 @@ its chunk. Chunks are reordered by sequence number before event decoding.
 Nanoseconds come from a least-squares calibration fit, or a single calibration
 point and the nominal clock frequency.
 
+The analyzer reads format v2 only; older format versions are rejected rather
+than interpreted with the wrong event layout. Task ends carry no task ID: they
+close the most recent task begin on that thread, including after a different
+task has run there.
+
+`info` lists the recorded event classes from the process record. Disabled classes
+mean **not recorded**, not zero activity. If that record is missing, class
+availability is unknown. Executor utilization requires both `sched` and `loop`
+to separate scheduler work from blocking polls; blocking-worker utilization
+requires `work` to distinguish jobs from idle time. Missing prerequisites produce
+`n/a` with an explanation, and unclassified timeline time is shown as `unknown`.
+Task statistics require `sched`; I/O and blocking statistics require `io` and
+`work`; plots require `user`. Their sections say `not recorded` when disabled.
+Without `stacks`, naming still uses explicit task functions, entry symbols, and
+address fallbacks. Migration-safe zone pairing requires `sched` and `user`;
+without task scheduling events, task ownership is unknown and zone statistics
+are unavailable. Messages and plots remain usable when `user` alone is recorded.
+
 `util` writes a self-contained, 1200-pixel-wide SVG and prints a thread table.
 Executor rows split each bin into task, scheduler, nonblocking poll, blocking
 poll, and tracing-flush time. Busy means task + scheduler + nonblocking poll;
 blocking workers use work / observed wall time, with the rest of their lifetime
 counted as idle (apart from trace-flush overhead). `thread_begin` and `thread_end`
 bound each thread's observed lifetime, including idle time before its first job
-and after its last. Older traces without these markers fall back to first/last
-events; either missing boundary falls back independently. Other threads display
+and after its last. If lifecycle markers are missing, first/last events provide
+fallback bounds; either missing boundary falls back independently. Other threads display
 point events rather than a utilization estimate. The row background and binned
 activity are clipped to the observed interval; time outside it is blank.
 Bins may average very short activity bursts.
@@ -198,3 +281,7 @@ Task zones use nestable asynchronous slices keyed by task ID, so a begin on one
 thread can match an end on another without falsely occupying a single thread
 for the entire wall duration. `--flows` adds wake-to-run arrows; omit it for a
 less crowded timeline.
+
+The Perfetto JSON also contains `zioTrace.recordedClasses` (or `null` for missing
+process metadata) and a note about unavailable classes. Unclassified thread
+intervals remain explicitly named; absent categories do not imply zero activity.

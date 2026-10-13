@@ -332,7 +332,7 @@ pub const LoopState = struct {
     }
 
     pub fn finishCompletion(self: *LoopState, completion: *Completion) void {
-        @import("../instrument/root.zig").ioComplete(completion);
+        @import("../instrument/root.zig").ioComplete(self.loop, completion);
         completion.enterDead();
 
         // Both callbacks below can free `completion`, so whichever may free it must
@@ -484,6 +484,7 @@ pub const LoopState = struct {
 pub const Loop = struct {
     state: LoopState,
     backend: Backend,
+    instr: @import("../instrument/root.zig").ThreadData = .{},
 
     allocator: std.mem.Allocator,
     thread_pool: ?*ThreadPool = null,
@@ -661,7 +662,7 @@ pub const Loop = struct {
             timer.c.err = null;
             timer.c.setLoop(self);
             _ = timer.c.enterRunning();
-            @import("../instrument/root.zig").ioSubmit(&timer.c);
+            @import("../instrument/root.zig").ioSubmit(self, &timer.c);
         }
         self.state.armTimer(timer);
     }
@@ -875,7 +876,7 @@ pub const Loop = struct {
     }
 
     fn addInternal(self: *Loop, completion: *Completion) void {
-        @import("../instrument/root.zig").ioSubmit(completion);
+        @import("../instrument/root.zig").ioSubmit(self, completion);
         completion.setLoop(self);
         const old = completion.enterRunning();
         if (old.phase == .dead) {
@@ -1459,9 +1460,9 @@ pub const Loop = struct {
                 timeout = .zero;
             }
         }
-        @import("../instrument/root.zig").pollBegin(should_poll, timeout);
+        @import("../instrument/root.zig").pollBegin(self, should_poll, timeout);
         const timed_out = if (should_poll) try self.backend.poll(&self.state, timeout) else false;
-        @import("../instrument/root.zig").pollEnd(should_poll, timed_out);
+        @import("../instrument/root.zig").pollEnd(self, should_poll, timed_out);
         // Awake again: take the requests, including any that arrived during
         // the poll, and clear `sleeping`.
         const wake_flags = self.state.wake_requested.swap(0, .acq_rel);

@@ -1,7 +1,7 @@
 const std = @import("std");
 const session_mod = @import("session.zig");
 const format = session_mod.format;
-pub const State = enum { task, scheduler, poll_check, poll_wait, flush, work, idle };
+pub const State = enum { task, scheduler, poll_check, poll_wait, flush, work, idle, unknown };
 pub const state_count = @typeInfo(State).@"enum".field_names.len;
 pub const Slice = struct {
     thread: u64,
@@ -14,6 +14,7 @@ pub const Slice = struct {
 pub const Flow = struct { task: u64, source_thread: u64, target_thread: u64, start: f64, end: f64 };
 pub const Thread = struct {
     info: format.record.Thread,
+    classes: ?u64 = null,
     durations: [state_count]f64 = @splat(0),
     first: ?f64 = null,
     last: f64 = 0,
@@ -30,19 +31,47 @@ pub const Thread = struct {
     parks: u64 = 0,
     state_slice: ?usize = null,
 
+    pub fn hasClass(self: Thread, class: format.EventClass) bool {
+        return if (self.classes) |mask| mask & class.mask() != 0 else false;
+    }
+
     fn state(self: Thread) State {
         if (self.flush) return .flush;
         return switch (self.info.kind) {
-            .executor => self.poll orelse if (self.task != null) State.task else State.scheduler,
-            .blocking => if (self.work != null) .work else .idle,
+            .executor => self.poll orelse if (self.task != null)
+                State.task
+            else if (self.hasClass(.sched) and self.hasClass(.loop))
+                State.scheduler
+            else
+                State.unknown,
+            .blocking => if (!self.hasClass(.work))
+                .unknown
+            else if (self.work != null)
+                .work
+            else
+                .idle,
             .other => .idle,
         };
     }
-    pub fn busyPercent(self: Thread) f64 {
-        if (self.info.kind == .other) return 0;
-        const wall = self.last - (self.first orelse self.last);
-        if (wall <= 0) return 0;
-        const busy = self.durations[@backingInt(State.task)] + self.durations[@backingInt(State.scheduler)] + self.durations[@backingInt(State.poll_check)] + self.durations[@backingInt(State.work)];
+
+    pub fn unavailableReason(self: Thread) ?[]const u8 {
+        if (self.info.kind == .other) return "point events only";
+        if (self.classes == null) return "recorded classes unknown";
+        if (self.info.kind == .executor) {
+            if (!self.hasClass(.sched)) return "sched not recorded";
+            if (!self.hasClass(.loop)) return "loop not recorded";
+        } else if (!self.hasClass(.work)) return "work not recorded";
+        if (self.first == null or self.last <= self.first.?) return "no observed interval";
+        return null;
+    }
+
+    pub fn busyPercent(self: Thread) ?f64 {
+        if (self.unavailableReason() != null) return null;
+        const wall = self.last - self.first.?;
+        const busy = self.durations[@backingInt(State.task)] +
+            self.durations[@backingInt(State.scheduler)] +
+            self.durations[@backingInt(State.poll_check)] +
+            self.durations[@backingInt(State.work)];
         return 100 * busy / wall;
     }
 };
@@ -109,7 +138,10 @@ pub const Model = struct {
     pub fn build(a: std.mem.Allocator, session: session_mod.Session) !Model {
         var self: Model = .{ .session = session };
         var threads = session.threads.valueIterator();
-        while (threads.next()) |info| try self.threads.append(a, .{ .info = info.* });
+        while (threads.next()) |info| try self.threads.append(a, .{
+            .info = info.*,
+            .classes = session.classMask(),
+        });
         std.mem.sort(Thread, self.threads.items, {}, threadLess);
         for (self.threads.items, 0..) |t, i| try self.thread_indices.put(a, t.info.thread, i);
         // Lifecycle markers take precedence even if a damaged file has events outside them.
@@ -157,6 +189,9 @@ pub const Model = struct {
                 }
             }
             t.cursor_ns = now;
+            if (format.classOf(std.meta.activeTag(event.event))) |class| {
+                if (!session.hasClass(class)) continue;
+            }
             switch (event.event) {
                 .task_create => |v| {
                     const task = try self.getTask(a, v.task);
@@ -186,16 +221,22 @@ pub const Model = struct {
                     }
                 },
                 .task_end => |v| {
-                    const task = try self.getTask(a, v.task);
-                    if (t.task == v.task) {
+                    if (t.task) |id| {
+                        const task = try self.getTask(a, id);
                         try task.runs.append(a, now - t.task_start);
                         task.run_total_ns += now - t.task_start;
-                        try self.slices.append(a, .{ .thread = event.thread, .start = t.task_start, .end = now, .kind = .task, .id = v.task });
+                        try self.slices.append(a, .{
+                            .thread = event.thread,
+                            .start = t.task_start,
+                            .end = now,
+                            .kind = .task,
+                            .id = id,
+                        });
                         t.task = null;
+                        if (v.reason == .finish) task.finished = now;
                     } else {
                         self.task_pair_errors += 1;
                     }
-                    if (v.reason == .finish) task.finished = now;
                 },
                 .task_wake => |v| {
                     const task = try self.getTask(a, v.task);
@@ -244,6 +285,7 @@ pub const Model = struct {
                     zone.location = v;
                 },
                 .zone_begin => |v| {
+                    if (!session.hasClass(.sched)) continue;
                     const owner: ZoneOwner = .{
                         .task = t.task != null,
                         .id = t.task orelse event.thread,
@@ -269,6 +311,7 @@ pub const Model = struct {
                     });
                 },
                 .zone_end => |v| {
+                    if (!session.hasClass(.sched)) continue;
                     const owner: ZoneOwner = .{
                         .task = t.task != null,
                         .id = t.task orelse event.thread,

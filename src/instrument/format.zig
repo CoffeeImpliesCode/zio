@@ -18,21 +18,22 @@
 //!
 //! Every dump file is a `FileHeader` followed by records until end of file:
 //!
-//!     record  := kind:u8  len:uleb128  payload[len]
+//!     record  := kind:u8  len:varint  payload[len]
 //!
-//! Record payloads (except `chunk`) and event payloads are sequences of
-//! fields in declaration order of their payload struct:
+//! `varint` is unsigned LEB128 (see `writeVarint`). Record payloads (except
+//! `chunk`) and event payloads are sequences of fields in declaration order
+//! of their payload struct:
 //!
-//!     u64, enum(uN)  -> uleb128
-//!     i64            -> zigzag, then uleb128
+//!     u64, enum(uN)  -> varint
+//!     i64            -> zigzag, then varint
 //!     bool           -> one byte, 0 or 1
-//!     []const u8     -> uleb128 length, then the bytes
-//!     AddrList       -> uleb128 count, then count uleb128 addresses
+//!     []const u8     -> varint length, then the bytes
+//!     AddrList       -> varint count, then count varint addresses
 //!
 //! A `chunk` record carries a run of one thread's events:
 //!
-//!     chunk   := thread:uleb128  seq:uleb128  base_ticks:uleb128  event*
-//!     event   := tag:u8  dt:uleb128  fields
+//!     chunk   := thread:varint  seq:varint  base_ticks:varint  event*
+//!     event   := tag:u8  dt:varint  fields
 //!
 //! `dt` is the tick delta from the previous event in the same chunk, or from
 //! `base_ticks` for the first one, so every chunk decodes on its own. A
@@ -48,7 +49,7 @@
 const std = @import("std");
 
 pub const magic = "ZIOTRACE".*;
-pub const version: u16 = 1;
+pub const version: u16 = 2;
 
 /// Name of the exported function whose run-time address the `process` record
 /// carries. The analyzer looks the symbol up in the executable to compute
@@ -109,12 +110,51 @@ pub const NameTable = enum(u8) {
     _,
 };
 
+/// Groups of events a session can record. `ZIO_PROFILE=1` records all of
+/// them; `ZIO_PROFILE=<name>,<name>...` only the listed ones. The `process`
+/// record says which were on, so an analyzer can tell "absent" from "never
+/// happened". Events outside every class (`classOf` null) are always on.
+pub const EventClass = enum(u6) {
+    /// Task lifecycle, executor parks and steals.
+    sched = 0,
+    /// Event loop backend waits and wake-ups.
+    loop = 1,
+    /// Event loop operation submit/complete.
+    io = 2,
+    /// Blocking thread pool work.
+    work = 3,
+    /// Spawn and first-suspend stacks for function attribution.
+    stacks = 4,
+    /// User zones, messages and plots.
+    user = 5,
+
+    pub fn mask(class: EventClass) u64 {
+        return @as(u64, 1) << @backingInt(class);
+    }
+};
+
+pub const all_classes: u64 = (1 << @typeInfo(EventClass).@"enum".field_names.len) - 1;
+
+pub fn classOf(tag: EventTag) ?EventClass {
+    return switch (tag) {
+        .executor_info, .task_create, .task_func, .task_begin, .task_end, .task_wake, .steal, .park_begin, .park_end => .sched,
+        .poll_begin, .poll_end, .loop_wake => .loop,
+        .io_submit, .io_complete => .io,
+        .work_queue, .work_begin, .work_end => .work,
+        .task_stack => .stacks,
+        .zone_begin, .zone_end, .srcloc, .message, .plot => .user,
+        .dropped, .flush_begin, .flush_end, .thread_begin, .thread_end => null,
+    };
+}
+
 pub const record = struct {
     pub const Process = struct {
         /// Executable path as seen by the traced process (/proc/self/exe).
         exe_path: []const u8,
         /// Run-time address of `anchor_symbol`.
         anchor_addr: u64,
+        /// `EventClass` bits recorded by this session.
+        classes: u64,
     };
 
     pub const Thread = struct {
@@ -206,7 +246,7 @@ pub const AddrList = struct {
         pub fn next(it: *Iterator) DecodeError!?u64 {
             if (it.left == 0) return null;
             it.left -= 1;
-            return try readUleb(it.bytes, &it.pos);
+            return try readVarint(it.bytes, &it.pos);
         }
     };
 };
@@ -229,8 +269,8 @@ pub const Event = union(enum(u8)) {
     task_stack: struct { task: u64, kind: StackKind, frames: AddrList } = 4,
     /// `task` starts or resumes running on this thread.
     task_begin: struct { task: u64 } = 5,
-    /// `task` stops running on this thread.
-    task_end: struct { task: u64, reason: TaskEndReason } = 6,
+    /// The task of the latest `task_begin` on this thread stops running here.
+    task_end: struct { reason: TaskEndReason } = 6,
     /// This thread made `task` runnable.
     task_wake: struct { task: u64 } = 7,
 
@@ -288,10 +328,12 @@ pub fn Payload(comptime tag: EventTag) type {
 
 pub const DecodeError = error{ Truncated, Overflow, InvalidValue };
 
-/// Largest uleb128 encoding of a u64.
-pub const max_uleb_len = 10;
+// LEB128. The prefix-varint experiment lost on common scheduler events.
 
-pub inline fn writeUleb(buf: []u8, value: u64) usize {
+/// Largest varint encoding of a u64.
+pub const max_varint_len = 10;
+
+pub inline fn writeVarint(buf: []u8, value: u64) usize {
     var v = value;
     var i: usize = 0;
     while (v >= 0x80) : (i += 1) {
@@ -302,14 +344,14 @@ pub inline fn writeUleb(buf: []u8, value: u64) usize {
     return i + 1;
 }
 
-pub fn ulebLen(value: u64) usize {
+pub fn varintLen(value: u64) usize {
     var v = value;
     var n: usize = 1;
     while (v >= 0x80) : (n += 1) v >>= 7;
     return n;
 }
 
-pub fn readUleb(bytes: []const u8, pos: *usize) DecodeError!u64 {
+pub fn readVarint(bytes: []const u8, pos: *usize) DecodeError!u64 {
     var result: u64 = 0;
     var shift: u32 = 0;
     while (true) {
@@ -337,11 +379,11 @@ pub inline fn unzigzag(value: u64) i64 {
 
 fn fieldMaxLen(comptime T: type) ?usize {
     return switch (T) {
-        u64, i64 => max_uleb_len,
+        u64, i64 => max_varint_len,
         bool => 1,
         []const u8, AddrList => null,
         else => switch (@typeInfo(T)) {
-            .@"enum" => ulebLen(std.math.maxInt(@typeInfo(T).@"enum".tag_type)),
+            .@"enum" => varintLen(std.math.maxInt(@typeInfo(T).@"enum".tag_type)),
             else => @compileError("unsupported trace field type " ++ @typeName(T)),
         },
     };
@@ -362,16 +404,16 @@ pub fn fieldsLen(payload: anytype) usize {
     inline for (info.field_names, info.field_types) |name, T| {
         const value = @field(payload, name);
         total += switch (T) {
-            u64 => ulebLen(value),
-            i64 => ulebLen(zigzag(value)),
+            u64 => varintLen(value),
+            i64 => varintLen(zigzag(value)),
             bool => 1,
-            []const u8 => ulebLen(value.len) + value.len,
+            []const u8 => varintLen(value.len) + value.len,
             AddrList => blk: {
-                var n = ulebLen(value.items.len);
-                for (value.items) |addr| n += ulebLen(addr);
+                var n = varintLen(value.items.len);
+                for (value.items) |addr| n += varintLen(addr);
                 break :blk n;
             },
-            else => ulebLen(@backingInt(value)),
+            else => varintLen(@backingInt(value)),
         };
     }
     return total;
@@ -385,22 +427,22 @@ pub inline fn writeFields(buf: []u8, payload: anytype) usize {
     inline for (info.field_names, info.field_types) |name, T| {
         const value = @field(payload, name);
         switch (T) {
-            u64 => i += writeUleb(buf[i..], value),
-            i64 => i += writeUleb(buf[i..], zigzag(value)),
+            u64 => i += writeVarint(buf[i..], value),
+            i64 => i += writeVarint(buf[i..], zigzag(value)),
             bool => {
                 buf[i] = @intFromBool(value);
                 i += 1;
             },
             []const u8 => {
-                i += writeUleb(buf[i..], value.len);
+                i += writeVarint(buf[i..], value.len);
                 @memcpy(buf[i..][0..value.len], value);
                 i += value.len;
             },
             AddrList => {
-                i += writeUleb(buf[i..], value.items.len);
-                for (value.items) |addr| i += writeUleb(buf[i..], addr);
+                i += writeVarint(buf[i..], value.items.len);
+                for (value.items) |addr| i += writeVarint(buf[i..], addr);
             },
-            else => i += writeUleb(buf[i..], @backingInt(value)),
+            else => i += writeVarint(buf[i..], @backingInt(value)),
         }
     }
     return i;
@@ -412,8 +454,8 @@ pub fn readFields(comptime P: type, bytes: []const u8, pos: *usize) DecodeError!
     var result: P = undefined;
     inline for (info.field_names, info.field_types) |name, T| {
         @field(result, name) = switch (T) {
-            u64 => try readUleb(bytes, pos),
-            i64 => unzigzag(try readUleb(bytes, pos)),
+            u64 => try readVarint(bytes, pos),
+            i64 => unzigzag(try readVarint(bytes, pos)),
             bool => blk: {
                 if (pos.* >= bytes.len) return error.Truncated;
                 const byte = bytes[pos.*];
@@ -425,22 +467,22 @@ pub fn readFields(comptime P: type, bytes: []const u8, pos: *usize) DecodeError!
                 };
             },
             []const u8 => blk: {
-                const len = try readUleb(bytes, pos);
+                const len = try readVarint(bytes, pos);
                 if (len > bytes.len - pos.*) return error.Truncated;
                 const start = pos.*;
                 pos.* += @intCast(len);
                 break :blk bytes[start..pos.*];
             },
             AddrList => blk: {
-                const count = try readUleb(bytes, pos);
+                const count = try readVarint(bytes, pos);
                 const start = pos.*;
                 var n: u64 = 0;
-                while (n < count) : (n += 1) _ = try readUleb(bytes, pos);
+                while (n < count) : (n += 1) _ = try readVarint(bytes, pos);
                 break :blk .{ .count = @intCast(count), .encoded = bytes[start..pos.*] };
             },
             else => blk: {
                 const Tag = @typeInfo(T).@"enum".tag_type;
-                const raw = try readUleb(bytes, pos);
+                const raw = try readVarint(bytes, pos);
                 const narrow = std.math.cast(Tag, raw) orelse return error.InvalidValue;
                 break :blk std.enums.fromInt(T, narrow) orelse return error.InvalidValue;
             },
@@ -454,11 +496,11 @@ pub fn readFields(comptime P: type, bytes: []const u8, pos: *usize) DecodeError!
 
 /// Upper bound on the encoded size of an event without slice fields, or null.
 pub fn eventMaxLen(comptime tag: EventTag) ?usize {
-    return 1 + max_uleb_len + (fieldsMaxLen(Payload(tag)) orelse return null);
+    return 1 + max_varint_len + (fieldsMaxLen(Payload(tag)) orelse return null);
 }
 
 pub fn eventLen(comptime tag: EventTag, dt: u64, payload: Payload(tag)) usize {
-    return 1 + ulebLen(dt) + fieldsLen(payload);
+    return 1 + varintLen(dt) + fieldsLen(payload);
 }
 
 /// Encode one event into `buf`, which must hold `eventLen(...)` bytes (or
@@ -466,7 +508,7 @@ pub fn eventLen(comptime tag: EventTag, dt: u64, payload: Payload(tag)) usize {
 pub inline fn writeEvent(buf: []u8, comptime tag: EventTag, dt: u64, payload: Payload(tag)) usize {
     buf[0] = @backingInt(tag);
     var i: usize = 1;
-    i += writeUleb(buf[i..], dt);
+    i += writeVarint(buf[i..], dt);
     i += writeFields(buf[i..], payload);
     return i;
 }
@@ -494,7 +536,7 @@ pub const EventIterator = struct {
         const raw_tag = it.bytes[it.pos];
         it.pos += 1;
         const tag = std.enums.fromInt(EventTag, raw_tag) orelse return error.InvalidValue;
-        it.ticks +%= try readUleb(it.bytes, &it.pos);
+        it.ticks +%= try readVarint(it.bytes, &it.pos);
         const event: Event = switch (tag) {
             inline else => |t| @unionInit(Event, @tagName(t), try readFields(Payload(t), it.bytes, &it.pos)),
         };
@@ -517,12 +559,12 @@ pub fn RecordPayload(comptime kind: RecordKind) type {
     };
 }
 
-/// Upper bound on a record header: kind byte plus a uleb128 length.
-pub const max_record_header_len = 1 + max_uleb_len;
+/// Upper bound on a record header: kind byte plus a varint length.
+pub const max_record_header_len = 1 + max_varint_len;
 
 pub fn writeRecordHeader(buf: []u8, kind: RecordKind, payload_len: u64) usize {
     buf[0] = @backingInt(kind);
-    return 1 + writeUleb(buf[1..], payload_len);
+    return 1 + writeVarint(buf[1..], payload_len);
 }
 
 pub const RawRecord = struct {
@@ -576,7 +618,7 @@ pub const FileReader = struct {
         if (self.pos >= self.bytes.len) return null;
         const kind: RecordKind = @fromBackingInt(self.bytes[self.pos]);
         var pos = self.pos + 1;
-        const len = try readUleb(self.bytes, &pos);
+        const len = try readVarint(self.bytes, &pos);
         if (len > self.bytes.len - pos) return error.Truncated;
         const payload = self.bytes[pos..][0..@intCast(len)];
         self.pos = pos + payload.len;
@@ -587,20 +629,61 @@ pub const FileReader = struct {
 // ---------------------------------------------------------------------------
 // Tests
 
-test "uleb128 and zigzag round trip" {
-    var buf: [max_uleb_len]u8 = undefined;
+test "varint and zigzag round trip" {
+    var buf: [max_varint_len]u8 = undefined;
     for ([_]u64{ 0, 1, 127, 128, 300, std.math.maxInt(u32), std.math.maxInt(u64) }) |v| {
-        const n = writeUleb(&buf, v);
-        try std.testing.expectEqual(ulebLen(v), n);
+        const n = writeVarint(&buf, v);
+        try std.testing.expectEqual(varintLen(v), n);
         var pos: usize = 0;
-        try std.testing.expectEqual(v, try readUleb(buf[0..n], &pos));
+        try std.testing.expectEqual(v, try readVarint(buf[0..n], &pos));
         try std.testing.expectEqual(n, pos);
     }
     for ([_]i64{ 0, -1, 1, std.math.minInt(i64), std.math.maxInt(i64) }) |v| {
         try std.testing.expectEqual(v, unzigzag(zigzag(v)));
     }
     var pos: usize = 0;
-    try std.testing.expectError(error.Truncated, readUleb(&.{0x80}, &pos));
+    const n = writeVarint(&buf, std.math.maxInt(u64));
+    try std.testing.expectError(error.Truncated, readVarint(buf[0 .. n - 1], &pos));
+}
+
+test "field codec exact-sized buffers and truncated tails" {
+    const P = struct {
+        number: u64,
+        flag: bool,
+        reason: TaskEndReason,
+        name: []const u8,
+        value: i64,
+        frames: AddrList,
+    };
+    const addresses = [_]usize{ 0x555500400000, 1 };
+    const payload: P = .{
+        .number = std.math.maxInt(u64),
+        .flag = true,
+        .reason = .finish,
+        .name = "tail",
+        .value = -5,
+        .frames = .{ .items = &addresses },
+    };
+    var buf: [128]u8 = @splat(0xa5);
+    const n = fieldsLen(payload);
+    try std.testing.expectEqual(n, writeFields(buf[1..][0..n], payload));
+    try std.testing.expectEqual(@as(u8, 0xa5), buf[0]);
+    try std.testing.expectEqual(@as(u8, 0xa5), buf[n + 1]);
+    var pos: usize = 0;
+    const decoded = try readFields(P, buf[1..][0..n], &pos);
+    try std.testing.expectEqual(n, pos);
+    try std.testing.expectEqual(payload.number, decoded.number);
+    try std.testing.expectEqual(payload.flag, decoded.flag);
+    try std.testing.expectEqual(payload.reason, decoded.reason);
+    try std.testing.expectEqualStrings(payload.name, decoded.name);
+    try std.testing.expectEqual(payload.value, decoded.value);
+    var it = decoded.frames.iterator();
+    for (addresses) |address| try std.testing.expectEqual(address, (try it.next()).?);
+    try std.testing.expectEqual(null, try it.next());
+    for (0..n) |cut| {
+        pos = 0;
+        try std.testing.expectError(error.Truncated, readFields(P, buf[1..][0..cut], &pos));
+    }
 }
 
 test "events round trip through a chunk" {
@@ -608,7 +691,7 @@ test "events round trip through a chunk" {
     var len: usize = 0;
     const frames = [_]usize{ 0x1000, 0xdead_beef, 7 };
     len += writeEvent(buf[len..], .task_create, 5, .{ .task = 1, .entry = 0x4000, .executor = 2, .parent = 0, .group = 0 });
-    len += writeEvent(buf[len..], .task_end, 100, .{ .task = 1, .reason = .finish });
+    len += writeEvent(buf[len..], .task_end, 100, .{ .reason = .finish });
     len += writeEvent(buf[len..], .task_stack, 0, .{ .task = 1, .kind = .first_suspend, .frames = .{ .items = &frames } });
     len += writeEvent(buf[len..], .plot, 1, .{ .name = "queue", .value = -3 });
     len += writeEvent(buf[len..], .poll_end, 2, .{ .timed_out = true });

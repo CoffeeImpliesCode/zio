@@ -63,6 +63,9 @@ noinline fn standardSleep(io: std.Io, value: u64) u64 {
     io.sleep(.fromMilliseconds(75), .awake) catch {};
     return value * 2;
 }
+noinline fn standardGroupSleep(io: std.Io) std.Io.Cancelable!void {
+    try io.sleep(.fromMilliseconds(25), .awake);
+}
 pub fn main(init: std.process.Init) !void {
     const runtime = try zio.Runtime.init(init.gpa, .{ .executors = .exact(4) });
     defer runtime.deinit();
@@ -89,9 +92,12 @@ pub fn main(init: std.process.Init) !void {
     const io = runtime.io();
     var async_task = io.async(standardSleep, .{ io, @as(u64, 21) });
     var concurrent_task = try io.concurrent(standardSleep, .{ io, @as(u64, 22) });
+    var standard_group: std.Io.Group = .init;
+    standard_group.async(io, standardGroupSleep, .{io});
     zio.instrument.plot("async answer", @intCast(async_task.await(io)));
     zio.instrument.plot("concurrent answer", @intCast(concurrent_task.await(io)));
     zio.instrument.plot("blocking answer", @bitCast(blocking.join()));
+    try standard_group.await(io);
     try group.wait();
     zio.instrument.message("trace demo ends");
 }

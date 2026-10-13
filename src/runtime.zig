@@ -548,6 +548,7 @@ pub const Executor = struct {
     // Updated before every context switch into a task and after every switch back.
     // Used by getCurrentTaskOrNull() instead of the TLS current_context chain.
     current_task: ?*AnyTask,
+    instr: instrument.ThreadData = .{},
 
     // Depth of no-suspend regions on this thread; see `beginNoSuspend`. Unlike
     // clearing `current_task`, this leaves the task identity visible to locks,
@@ -788,7 +789,7 @@ pub const Executor = struct {
             while (self.getNextTask()) |next_task| {
                 updateParentContext(next_task, &self.main_task.coro.context);
                 self.current_task = next_task;
-                instrument.begin(next_task);
+                instrument.beginOn(self, next_task);
                 next_task.coro.step();
                 self.current_task = null;
                 self.processCleanup();
@@ -862,9 +863,9 @@ pub const Executor = struct {
     fn parkAndSearch(self: *Executor, check_ready: bool) !void {
         if (!migrates) {
             self.bump("parks_full", 1);
-            instrument.parkBegin(Duration.max);
+            instrument.parkBegin(self, Duration.max);
             try self.loop.poll(.max);
-            instrument.emit(.park_end, .{});
+            instrument.emitOn(self, .park_end, .{});
             self.drainDispatched();
             return;
         }
@@ -873,9 +874,9 @@ pub const Executor = struct {
         // real park; skip it.
         if (self.runtime.stealingActive()) {
             self.bump("parks_doze", 1);
-            instrument.parkBegin(Duration.zero);
+            instrument.parkBegin(self, Duration.zero);
             try self.loop.poll(.zero);
-            instrument.emit(.park_end, .{});
+            instrument.emitOn(self, .park_end, .{});
             self.drainDispatched();
             if (self.checkLocalWork(check_ready)) return self.leaveIdle();
         }
@@ -930,9 +931,9 @@ pub const Executor = struct {
         if (!found_work) found_work = self.rescueStuck();
         const wait: Duration = if (found_work) .zero else if (self.holdBaton()) baton_tick else .max;
         if (wait.value == baton_tick.value) self.bump("baton_parks", 1);
-        instrument.parkBegin(wait);
+        instrument.parkBegin(self, wait);
         try self.loop.poll(wait);
-        instrument.emit(.park_end, .{});
+        instrument.emitOn(self, .park_end, .{});
         // Drain before withdrawing the bit, so the post-park work checks
         // below see the woken batch.
         self.drainDispatched();
@@ -1133,7 +1134,7 @@ pub const Executor = struct {
 
             if (self.run_queue.steal(&victim.run_queue)) |node| {
                 _ = self.run_queue.push(node);
-                instrument.emit(.steal, .{ .victim = victim.id, .count = 1 });
+                instrument.emitOn(self, .steal, .{ .victim = victim.id, .count = 1 });
                 self.bump("steal_hits", 1);
                 if (hint_start and i == 0) self.bump("steal_hint_hits", 1);
                 // The rest of the loaded ring is still at the victim; point
@@ -1369,7 +1370,7 @@ pub const Executor = struct {
         if (self.getNextTask()) |next_task| {
             updateParentContext(next_task, &self.main_task.coro.context);
             self.current_task = next_task;
-            instrument.begin(next_task);
+            instrument.beginOn(self, next_task);
             coro.yieldTo(&next_task.coro);
         } else {
             coro.yield();

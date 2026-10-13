@@ -2,6 +2,11 @@ const std = @import("std");
 const format = @import("zio_trace_format");
 const Session = @import("session.zig").Session;
 const Model = @import("timeline.zig").Model;
+const all_recorded: format.record.Process = .{
+    .exe_path = "",
+    .anchor_addr = 0,
+    .classes = format.all_classes,
+};
 
 const Encoder = struct {
     bytes: [8192]u8 = undefined,
@@ -40,6 +45,7 @@ test "synthetic session calibration, reordered chunks, states and wake latency" 
     defer dir.close(io);
     defer std.Io.Dir.cwd().deleteTree(io, path) catch {};
     var process = Encoder.init();
+    process.record(.process, all_recorded);
     process.record(.calibration, .{ .ticks = 100, .monotonic_ns = 1000 });
     process.record(.calibration, .{ .ticks = 200, .monotonic_ns = 1200 });
     process.record(.end, .{ .dropped = 3 });
@@ -55,7 +61,7 @@ test "synthetic session calibration, reordered chunks, states and wake latency" 
     n += format.writeEvent(events[n..], .io_submit, 0, .{ .op = 7, .kind = 4 });
     n += format.writeEvent(events[n..], .plot, 0, .{ .name = "plot\nescaped", .value = -4 });
     n += format.writeEvent(events[n..], .zone_end, 10, .{ .srcloc = 5 });
-    n += format.writeEvent(events[n..], .task_end, 0, .{ .task = 1, .reason = .finish });
+    n += format.writeEvent(events[n..], .task_end, 0, .{ .reason = .finish });
     n += format.writeEvent(events[n..], .io_complete, 0, .{ .op = 7, .result = .ok });
     n += format.writeEvent(events[n..], .poll_begin, 0, .{ .timeout_ns = 0 });
     n += format.writeEvent(events[n..], .poll_end, 5, .{ .timed_out = false });
@@ -65,7 +71,7 @@ test "synthetic session calibration, reordered chunks, states and wake latency" 
     n = 0;
     n += format.writeEvent(events[n..], .task_create, 0, .{ .task = 1, .entry = 123, .executor = 2, .parent = 0, .group = 0 });
     n += format.writeEvent(events[n..], .task_begin, 0, .{ .task = 1 });
-    n += format.writeEvent(events[n..], .task_end, 10, .{ .task = 1, .reason = .wait });
+    n += format.writeEvent(events[n..], .task_end, 10, .{ .reason = .wait });
     n += format.writeEvent(events[n..], .poll_begin, 0, .{ .timeout_ns = 100 });
     n += format.writeEvent(events[n..], .poll_end, 20, .{ .timed_out = true });
     n += format.writeEvent(events[n..], .plot, 0, .{ .name = "plot\nescaped", .value = 6 });
@@ -90,12 +96,12 @@ test "synthetic session calibration, reordered chunks, states and wake latency" 
     const thread = model.thread(0).?;
     try std.testing.expectApproxEqAbs(@as(f64, 40), thread.durations[@backingInt(@import("timeline.zig").State.task)], 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 40), thread.durations[@backingInt(@import("timeline.zig").State.poll_wait)], 0.001);
-    try std.testing.expectApproxEqAbs(@as(f64, 100.0 * 70.0 / 120.0), thread.busyPercent(), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 100.0 * 70.0 / 120.0), thread.busyPercent().?, 0.001);
     const task = model.tasks.get(1).?;
     try std.testing.expectEqual(@as(usize, 2), task.runs.items.len);
     try std.testing.expectApproxEqAbs(@as(f64, 10), task.wakes.items[0], 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 90), model.thread(1).?.durations[@backingInt(@import("timeline.zig").State.work)], 0.001);
-    try std.testing.expectApproxEqAbs(@as(f64, 90), model.thread(1).?.busyPercent(), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 90), model.thread(1).?.busyPercent().?, 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 20), task.runs.items[0], 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 100), task.finished.? - task.created.?, 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 20), thread.durations[@backingInt(@import("timeline.zig").State.scheduler)], 0.001);
@@ -134,9 +140,10 @@ test "chunk sequence order survives equal timestamps and unknown events" {
     defer std.Io.Dir.cwd().deleteTree(io, path) catch {};
     defer dir.close(io);
     var file = Encoder.init();
+    file.record(.process, all_recorded);
     file.record(.thread, .{ .thread = 0, .os_tid = 7, .kind = .executor, .executor = 1, .name = "" });
     var bytes: [128]u8 = undefined;
-    var n = format.writeEvent(&bytes, .task_end, 0, .{ .task = 1, .reason = .finish });
+    var n = format.writeEvent(&bytes, .task_end, 0, .{ .reason = .finish });
     file.chunk(0, 2, 100, bytes[0..n]);
     n = format.writeEvent(&bytes, .task_begin, 0, .{ .task = 1 });
     bytes[n] = 255;
@@ -162,7 +169,12 @@ test "task zones follow migration and retain global source names" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var session: Session = .{ .path = "migration", .start_ns = 0, .end_ns = 100 };
+    var session: Session = .{
+        .path = "migration",
+        .start_ns = 0,
+        .end_ns = 100,
+        .process = all_recorded,
+    };
     for (0..2) |id| {
         try session.threads.put(a, id, .{
             .thread = id,
@@ -183,13 +195,11 @@ test "task zones follow migration and retain global source names" {
         } } },
         .{ .thread = 0, .ticks = 10, .ns = 10, .event = .{ .zone_begin = .{ .srcloc = 5 } } },
         .{ .thread = 0, .ticks = 20, .ns = 20, .event = .{ .task_end = .{
-            .task = 1,
             .reason = .wait,
         } } },
         .{ .thread = 1, .ticks = 80, .ns = 80, .event = .{ .task_begin = .{ .task = 1 } } },
         .{ .thread = 1, .ticks = 90, .ns = 90, .event = .{ .zone_end = .{ .srcloc = 5 } } },
         .{ .thread = 1, .ticks = 100, .ns = 100, .event = .{ .task_end = .{
-            .task = 1,
             .reason = .finish,
         } } },
     };
@@ -234,7 +244,7 @@ test "nested zone stacks isolate suspended tasks and outside-thread markers" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var session: Session = .{ .path = "nested" };
+    var session: Session = .{ .path = "nested", .process = all_recorded };
     for (0..2) |id| try session.threads.put(a, id, .{
         .thread = id,
         .os_tid = 100 + id,
@@ -246,17 +256,17 @@ test "nested zone stacks isolate suspended tasks and outside-thread markers" {
         E.at(0, 0, .{ .task_begin = .{ .task = 1 } }),
         E.at(0, 5, .{ .zone_begin = .{ .srcloc = 5 } }),
         E.at(0, 6, .{ .zone_begin = .{ .srcloc = 6 } }),
-        E.at(0, 10, .{ .task_end = .{ .task = 1, .reason = .wait } }),
+        E.at(0, 10, .{ .task_end = .{ .reason = .wait } }),
         E.at(0, 12, .{ .task_begin = .{ .task = 2 } }),
         E.at(0, 14, .{ .zone_begin = .{ .srcloc = 5 } }),
         E.at(0, 16, .{ .zone_end = .{ .srcloc = 5 } }),
-        E.at(0, 20, .{ .task_end = .{ .task = 2, .reason = .finish } }),
+        E.at(0, 20, .{ .task_end = .{ .reason = .finish } }),
         E.at(0, 21, .{ .zone_begin = .{ .srcloc = 5 } }),
         E.at(0, 23, .{ .zone_end = .{ .srcloc = 5 } }),
         E.at(1, 30, .{ .task_begin = .{ .task = 1 } }),
         E.at(1, 31, .{ .zone_end = .{ .srcloc = 6 } }),
         E.at(1, 32, .{ .zone_end = .{ .srcloc = 5 } }),
-        E.at(1, 40, .{ .task_end = .{ .task = 1, .reason = .finish } }),
+        E.at(1, 40, .{ .task_end = .{ .reason = .finish } }),
     };
     try session.events.appendSlice(a, &events);
     const model = try Model.build(a, session);
@@ -331,6 +341,7 @@ test "thread lifetime markers bound idle time and SVG observed background" {
     defer std.Io.Dir.cwd().deleteTree(io, path) catch {};
     defer dir.close(io);
     var process = Encoder.init();
+    process.record(.process, all_recorded);
     process.record(.calibration, .{ .ticks = 0, .monotonic_ns = 0 });
     process.record(.calibration, .{ .ticks = 1000, .monotonic_ns = 1000 });
     try dir.writeFile(io, .{
@@ -365,11 +376,11 @@ test "thread lifetime markers bound idle time and SVG observed background" {
     try std.testing.expectEqual(@as(f64, 900), worker.last);
     try std.testing.expectEqual(@as(f64, 200), worker.durations[@backingInt(@import("timeline.zig").State.work)]);
     try std.testing.expectEqual(@as(f64, 600), worker.durations[@backingInt(@import("timeline.zig").State.idle)]);
-    try std.testing.expectEqual(@as(f64, 25), worker.busyPercent());
+    try std.testing.expectEqual(@as(f64, 25), worker.busyPercent().?);
     const legacy = model.thread(1).?;
     try std.testing.expectEqual(@as(f64, 200), legacy.first.?);
     try std.testing.expectEqual(@as(f64, 400), legacy.last);
-    try std.testing.expectEqual(@as(f64, 20), legacy.busyPercent());
+    try std.testing.expectEqual(@as(f64, 20), legacy.busyPercent().?);
     try std.testing.expectEqual(@as(f64, 50), model.thread(2).?.first.?);
     try std.testing.expectEqual(@as(f64, 950), model.thread(2).?.last);
     try std.testing.expectEqual(@as(f64, 150), model.thread(3).?.first.?);
@@ -379,4 +390,151 @@ test "thread lifetime markers bound idle time and SVG observed background" {
     try std.testing.expect(std.mem.indexOf(u8, svg.written(), "<rect class=\"observed-interval\" x=\"387.000\" y=\"82.000\"" ++
         " width=\"696.000\" height=\"44\" fill=\"#fafafa\"/>") != null);
     try std.testing.expect(std.mem.indexOf(u8, svg.written(), "mean busy 25.0%") != null);
+}
+
+test "sched-only recording pairs implicit task ends without claiming utilization" {
+    const E = struct {
+        fn at(ns: u64, event: format.Event) @import("session.zig").Event {
+            return .{ .thread = 0, .ticks = ns, .ns = @floatFromInt(ns), .event = event };
+        }
+    };
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var session: Session = .{
+        .path = "sched-only",
+        .start_ns = 0,
+        .end_ns = 100,
+        .process = .{
+            .exe_path = "",
+            .anchor_addr = 0,
+            .classes = format.EventClass.sched.mask(),
+        },
+    };
+    for (0..2) |id| try session.threads.put(a, id, .{
+        .thread = id,
+        .os_tid = id,
+        .executor = id,
+        .name = "",
+        .kind = if (id == 0) .executor else .blocking,
+    });
+    const events = [_]@import("session.zig").Event{
+        E.at(0, .{ .thread_begin = .{} }),
+        E.at(5, .{ .task_create = .{
+            .task = 1,
+            .entry = 0x111,
+            .executor = 0,
+            .parent = 0,
+            .group = 0,
+        } }),
+        E.at(5, .{ .task_func = .{ .task = 1, .func = 0xabc } }),
+        E.at(6, .{ .task_create = .{
+            .task = 2,
+            .entry = 0x222,
+            .executor = 0,
+            .parent = 0,
+            .group = 0,
+        } }),
+        E.at(10, .{ .task_begin = .{ .task = 1 } }),
+        E.at(20, .{ .task_end = .{ .reason = .wait } }),
+        E.at(30, .{ .task_begin = .{ .task = 2 } }),
+        E.at(50, .{ .task_end = .{ .reason = .finish } }),
+        E.at(60, .{ .task_begin = .{ .task = 1 } }),
+        E.at(80, .{ .task_end = .{ .reason = .finish } }),
+        E.at(100, .{ .thread_end = .{} }),
+    };
+    try session.events.appendSlice(a, &events);
+    var model = try Model.build(a, session);
+    try std.testing.expectEqual(@as(usize, 0), model.task_pair_errors);
+    try std.testing.expectEqual(@as(usize, 0), model.incomplete_slices);
+    try std.testing.expectEqualSlices(f64, &.{ 10, 20 }, model.tasks.get(1).?.runs.items);
+    try std.testing.expectEqualSlices(f64, &.{20}, model.tasks.get(2).?.runs.items);
+    try std.testing.expect(model.thread(0).?.busyPercent() == null);
+    try std.testing.expect(model.thread(1).?.busyPercent() == null);
+    try std.testing.expectEqual(@as(f64, 50), model.thread(0).?.durations[@backingInt(@import("timeline.zig").State.unknown)]);
+    try @import("naming.zig").resolve(a, &model, null);
+    try std.testing.expectEqualStrings("0xabc", model.tasks.get(1).?.name);
+    try std.testing.expectEqualStrings("0x222", model.tasks.get(2).?.name);
+    var report: std.Io.Writer.Allocating = .init(a);
+    try @import("report.zig").stats(a, &report.writer, &model);
+    try std.testing.expect(std.mem.indexOf(u8, report.written(), "Recorded classes: sched") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report.written(), "loop not recorded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report.written(), "I/O: not recorded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report.written(), "Blocking pool: not recorded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report.written(), "Zones: not recorded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report.written(), "Plots: not recorded") != null);
+    var svg: std.Io.Writer.Allocating = .init(a);
+    try @import("svg.zig").write(a, &svg.writer, &model, 10);
+    try std.testing.expect(std.mem.indexOf(u8, svg.written(), "mean busy n/a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, svg.written(), "loop not recorded") != null);
+    var json: std.Io.Writer.Allocating = .init(a);
+    try @import("perfetto.zig").write(a, &json.writer, &model, true);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json.written(), .{});
+    const classes = parsed.value.object.get("zioTrace").?.object.get("recordedClasses").?.array;
+    try std.testing.expectEqual(@as(usize, 1), classes.items.len);
+    try std.testing.expectEqualStrings("sched", classes.items[0].string);
+    try session.events.append(a, E.at(110, .{ .task_end = .{ .reason = .finish } }));
+    const unmatched = try Model.build(a, session);
+    try std.testing.expectEqual(@as(usize, 1), unmatched.task_pair_errors);
+}
+
+test "user-only and missing metadata recordings do not infer scheduler diagnostics" {
+    const E = struct {
+        fn at(ns: u64, event: format.Event) @import("session.zig").Event {
+            return .{ .thread = 0, .ticks = ns, .ns = @floatFromInt(ns), .event = event };
+        }
+    };
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var session: Session = .{
+        .path = "user-only",
+        .start_ns = 0,
+        .end_ns = 100,
+        .process = .{
+            .exe_path = "",
+            .anchor_addr = 0,
+            .classes = format.EventClass.user.mask(),
+        },
+    };
+    try session.threads.put(a, 0, .{
+        .thread = 0,
+        .os_tid = 10,
+        .executor = 0,
+        .name = "",
+        .kind = .executor,
+    });
+    const events = [_]@import("session.zig").Event{
+        E.at(0, .{ .thread_begin = .{} }),
+        // Off-class events must never manufacture a task pairing failure.
+        E.at(1, .{ .task_end = .{ .reason = .finish } }),
+        E.at(2, .{ .zone_begin = .{ .srcloc = 5 } }),
+        E.at(3, .{ .plot = .{ .name = "recorded plot", .value = 7 } }),
+        E.at(4, .{ .zone_end = .{ .srcloc = 5 } }),
+        E.at(100, .{ .thread_end = .{} }),
+    };
+    try session.events.appendSlice(a, &events);
+    var model = try Model.build(a, session);
+    try std.testing.expectEqual(@as(usize, 0), model.task_pair_errors);
+    try std.testing.expectEqual(@as(usize, 0), model.incomplete_slices);
+    try std.testing.expectEqual(@as(u32, 0), model.tasks.count());
+    try std.testing.expect(model.thread(0).?.busyPercent() == null);
+    try std.testing.expectEqual(@as(u64, 1), model.plots.get("recorded plot").?.count);
+    var report: std.Io.Writer.Allocating = .init(a);
+    try @import("report.zig").stats(a, &report.writer, &model);
+    try std.testing.expect(std.mem.indexOf(u8, report.written(), "Tasks: not recorded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report.written(), "Zones: unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report.written(), "recorded plot: count=1") != null);
+    session.process = null;
+    var unknown = try Model.build(a, session);
+    try std.testing.expect(unknown.thread(0).?.busyPercent() == null);
+    try std.testing.expectEqual(@as(usize, 0), unknown.task_pair_errors);
+    var unknown_report: std.Io.Writer.Allocating = .init(a);
+    try @import("report.zig").stats(a, &unknown_report.writer, &unknown);
+    try std.testing.expect(std.mem.indexOf(u8, unknown_report.written(), "Recorded classes: unknown (missing process record)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unknown_report.written(), "Plots: not recorded (recorded classes unknown)") != null);
+    var json: std.Io.Writer.Allocating = .init(a);
+    try @import("perfetto.zig").write(a, &json.writer, &unknown, true);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json.written(), .{});
+    try std.testing.expect(parsed.value.object.get("zioTrace").?.object.get("recordedClasses").? == .null);
 }

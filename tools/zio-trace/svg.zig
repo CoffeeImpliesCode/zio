@@ -1,7 +1,10 @@
 const std = @import("std");
 const timeline = @import("timeline.zig");
 const Writer = std.Io.Writer;
-const colors = [_][]const u8{ "#2563eb", "#60a5fa", "#22c55e", "#cbd5e1", "#f97316", "#7c3aed", "#f1f5f9" };
+const colors = [_][]const u8{
+    "#2563eb", "#60a5fa", "#22c55e", "#cbd5e1",
+    "#f97316", "#7c3aed", "#f1f5f9", "#94a3b8",
+};
 
 pub fn write(a: std.mem.Allocator, w: *Writer, model: *const timeline.Model, bins: usize) !void {
     const width: f64 = 870;
@@ -12,7 +15,8 @@ pub fn write(a: std.mem.Allocator, w: *Writer, model: *const timeline.Model, bin
     const bin_width = width / @as(f64, @floatFromInt(bins));
     try w.print("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1200\" height=\"{d}\" viewBox=\"0 0 1200 {d}\"><style>text{{font-family:system-ui,sans-serif;fill:#0f172a;font-size:12px}}.title{{font-size:20px;font-weight:600}}.minor{{fill:#475569;font-size:11px}}</style><rect width=\"1200\" height=\"{d}\" fill=\"white\"/><text x=\"20\" y=\"28\" class=\"title\">zio thread utilization</text>\n", .{ height, height, height });
     inline for (@typeInfo(timeline.State).@"enum".field_names, colors, 0..) |name, color, i| {
-        try w.print("<rect x=\"{d}\" y=\"45\" width=\"12\" height=\"12\" fill=\"{s}\"/><text x=\"{d}\" y=\"56\">{s}</text>\n", .{ 20 + i * 155, color, 38 + i * 155, name });
+        try w.print("<rect x=\"{d}\" y=\"45\" width=\"12\" height=\"12\"" ++
+            " fill=\"{s}\"/><text x=\"{d}\" y=\"56\">{s}</text>\n", .{ 20 + i * 145, color, 38 + i * 145, name });
     }
     const fractions = try a.alloc([timeline.state_count]f64, bins);
     for (model.threads.items, 0..) |thread, row| {
@@ -33,7 +37,13 @@ pub fn write(a: std.mem.Allocator, w: *Writer, model: *const timeline.Model, bin
         try w.print("<text x=\"20\" y=\"{d:.2}\">thread {d} · {s} · tid {d}</text>\n", .{ y + 15, thread.info.thread, @tagName(thread.info.kind), thread.info.os_tid });
         try w.print("<text x=\"20\" y=\"{d:.2}\" class=\"minor\">executor ", .{y + 34});
         if (thread.info.executor == @import("zio_trace_format").no_executor) try w.writeAll("—") else try w.print("{d}", .{thread.info.executor});
-        if (thread.info.kind == .other) try w.writeAll(" · point events; busy n/a</text>\n") else try w.print(" · mean busy {d:.1}%</text>\n", .{thread.busyPercent()});
+        if (thread.busyPercent()) |busy| {
+            try w.print(" · mean busy {d:.1}%</text>\n", .{busy});
+        } else {
+            try w.writeAll(" · mean busy n/a</text>\n");
+            const reason = thread.unavailableReason().?;
+            try w.print("<text x=\"20\" y=\"{d:.2}\" class=\"minor\">{s}</text>\n", .{ y + 51, reason });
+        }
         try w.print(
             "<rect x=\"300\" y=\"{d:.2}\" width=\"870\" height=\"44\"" ++
                 " fill=\"none\" stroke=\"#e2e8f0\"/>\n",
@@ -76,5 +86,10 @@ pub fn write(a: std.mem.Allocator, w: *Writer, model: *const timeline.Model, bin
         const fraction = @as(f64, @floatFromInt(tick)) / 6;
         try w.print("<path d=\"M {d:.2} {d} v 5\" stroke=\"#64748b\"/><text x=\"{d:.2}\" y=\"{d}\" text-anchor=\"middle\">{d:.2} ms</text>\n", .{ left + width * fraction, axis_y, left + width * fraction, axis_y + 21, duration * fraction / 1e6 });
     }
-    try w.print("<text x=\"300\" y=\"{d}\" class=\"minor\">Relative to first event; bars show fractions of each time bin. Blank time is outside a thread's observed interval.</text></svg>\n", .{axis_y + 43});
+    try w.print("<text x=\"300\" y=\"{d}\" class=\"minor\">" ++
+        "Relative to first event; bars show fractions of each time bin. " ++
+        "Blank time is outside a thread's observed interval.</text>\n", .{axis_y + 43});
+    try w.print("<text x=\"300\" y=\"{d}\" class=\"minor\">" ++
+        "Unknown = unclassified time. Executor utilization requires sched+loop; " ++
+        "blocking utilization requires work.</text></svg>\n", .{axis_y + 58});
 }

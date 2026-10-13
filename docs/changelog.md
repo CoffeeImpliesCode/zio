@@ -29,10 +29,12 @@ All notable changes to this project will be documented in this file.
   a byte range ahead of a `sync`.
 
 - Added optional runtime tracing, compiled in with `-Dinstrument=true` (or
-  `zio_options.instrument`) and started with `ZIO_PROFILE=1`. It records per-thread task,
-  scheduler, event loop, I/O and blocking pool events under `.zio/<timestamp>/`, and the
-  new `zio-trace` tool turns them into utilization plots, statistics and Perfetto
-  timelines. See `docs/instrumentation.md`.
+  `zio_options.instrument`). `ZIO_PROFILE=1` records all classes. A list such as
+  `ZIO_PROFILE=sched,loop` selects classes. Format v2 uses compact task IDs,
+  implicit task ends, and stacks only for unknown functions. The `zio-trace`
+  tool reads v2 dumps under `.zio/<timestamp>/` and writes utilization plots,
+  statistics, and Perfetto timelines. Disabled classes show as not recorded.
+  See `docs/instrumentation.md`.
 
 ### Fixed
 

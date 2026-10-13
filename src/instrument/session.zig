@@ -6,12 +6,15 @@ const Buffer = @import("buffer.zig").Buffer;
 const allocator = std.heap.page_allocator;
 const stack = @import("stack.zig");
 const os_thread = @import("../os/thread.zig");
+const classes = @import("classes.zig");
 
-pub var running: std.atomic.Value(bool) = .init(false);
+pub var class_mask: std.atomic.Value(u64) = .init(0);
 var lifecycle: @import("../os/thread.zig").Mutex = .init();
 var registry: @import("../os/thread.zig").Mutex = .init();
 var refs: usize = 0;
 var generation: std.atomic.Value(u64) = .init(0);
+var next_task_id: std.atomic.Value(u64) = .init(1);
+const task_id_block = 1024;
 var threads: std.ArrayList(*Thread) = .empty;
 var writer: ?std.Thread = null;
 var stop: std.atomic.Value(bool) = .init(false);
@@ -28,7 +31,8 @@ pub const Thread = struct {
     fd: std.c.fd_t,
     index: u64,
     seq: u64 = 0,
-    counter: u32 = 0,
+    id_next: u64 = 0,
+    id_end: u64 = 0,
     current: u64 = 0,
     spawn_func: u64 = 0,
     buffers: [2]Buffer = .{ .{}, .{} },
@@ -37,11 +41,22 @@ pub const Thread = struct {
     buffer: *Buffer = undefined,
     pending: std.atomic.Value(u32) = .init(0),
     stack_bounds: stack.Bounds = .{},
+    classes: u64 = format.all_classes,
     sources: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
     pub fn init(self: *Thread, fd: std.c.fd_t, index: u64, bounds: stack.Bounds) void {
         self.* = .{ .fd = fd, .index = index, .stack_bounds = bounds };
         self.buffer = &self.buffers[0];
+    }
+
+    pub inline fn nextTaskId(self: *Thread) u64 {
+        if (self.id_next == self.id_end) {
+            self.id_next = next_task_id.fetchAdd(task_id_block, .monotonic);
+            self.id_end = self.id_next + task_id_block;
+        }
+        const id = self.id_next;
+        self.id_next += 1;
+        return id;
     }
 
     pub inline fn emit(self: *Thread, comptime tag: format.EventTag, payload: format.Payload(tag)) void {
@@ -192,7 +207,7 @@ fn openFile(name: [:0]const u8) !std.c.fd_t {
     return fd;
 }
 
-fn begin() !void {
+fn begin(selected: u64) !void {
     const start = clock.realtime();
     const pid: u64 = @intCast(std.c.getpid());
     header = .{ .clock = clock.kind, .ticks_per_second = if (clock.kind == .monotonic_ns) std.time.ns_per_s else 0, .pid = pid, .start_realtime_ns = start };
@@ -209,16 +224,17 @@ fn begin() !void {
     errdefer _ = std.c.close(process_fd);
     var exe: [4096]u8 = undefined;
     const exe_len = if (builtin.os.tag == .linux) std.c.readlink("/proc/self/exe", &exe, exe.len) else -1;
-    writeRecord(process_fd, .process, .{ .exe_path = if (exe_len > 0) exe[0..@intCast(exe_len)] else "", .anchor_addr = @intFromPtr(&anchor) });
+    writeRecord(process_fd, .process, .{ .exe_path = if (exe_len > 0) exe[0..@intCast(exe_len)] else "", .anchor_addr = @intFromPtr(&anchor), .classes = selected });
     inline for (@typeInfo(@import("../ev/completion.zig").Op).@"enum".field_names, 0..) |op_name, i| {
         writeRecord(process_fd, .name, .{ .table = .io_op, .value = i, .name = op_name });
     }
     dropped.store(0, .monotonic);
+    next_task_id.store(1, .monotonic);
     calibration();
     stop.store(false, .release);
     if (!builtin.single_threaded) writer = try std.Thread.spawn(.{}, writerMain, .{});
     _ = generation.fetchAdd(1, .monotonic);
-    running.store(true, .release);
+    class_mask.store(selected, .release);
 }
 
 fn anchor() callconv(.c) void {}
@@ -232,8 +248,18 @@ pub noinline fn acquire() void {
     refs += 1;
     if (refs == 1) {
         const value = std.c.getenv("ZIO_PROFILE") orelse return;
-        if (!std.mem.eql(u8, std.mem.span(value), "1")) return;
-        begin() catch |err| {
+        const text = std.mem.span(value);
+        const selection = classes.parse(text);
+        if (selection.unknown != 0) {
+            var tokens = std.mem.splitScalar(u8, text, ',');
+            while (tokens.next()) |raw| {
+                const name = std.mem.trim(u8, raw, " \t\r\n");
+                if (name.len != 0 and classes.classForName(name) == null)
+                    std.log.warn("unknown ZIO_PROFILE class '{s}'; ignoring it", .{name});
+            }
+        }
+        if (selection.mask == 0) return;
+        begin(selection.mask) catch |err| {
             std.log.err("zio trace setup failed: {s}", .{@errorName(err)});
             return;
         };
@@ -246,8 +272,8 @@ pub noinline fn release() void {
     if (refs == 0) return;
     refs -= 1;
     if (refs != 0) return;
-    if (!running.load(.monotonic)) return;
-    running.store(false, .release);
+    if (class_mask.load(.monotonic) == 0) return;
+    class_mask.store(0, .release);
     // Runtime workers have been joined; external event emitters must be quiescent.
     for (threads.items) |thread| finishThread(thread);
     stop.store(true, .release);
@@ -266,7 +292,7 @@ pub noinline fn release() void {
 }
 
 pub inline fn getThread(kind: format.ThreadKind, executor: u64) ?*Thread {
-    if (!running.load(.acquire)) return null;
+    if (class_mask.load(.acquire) == 0) return null;
     const current_generation = generation.load(.monotonic);
     if (local_generation == current_generation) if (local) |thread| return thread;
     return registerThread(kind, executor, current_generation);
@@ -284,6 +310,7 @@ noinline fn registerThread(kind: format.ThreadKind, executor: u64, current_gener
         return null;
     };
     thread.init(fd, index, stack.threadBounds());
+    thread.classes = class_mask.load(.monotonic);
     threads.append(allocator, thread) catch {
         allocator.destroy(thread);
         _ = std.c.close(fd);
@@ -401,7 +428,7 @@ test "instrument inactive lifecycle balances nested runtimes without starting wr
         release();
     }
     try std.testing.expectEqual(2, refs);
-    try std.testing.expect(!running.load(.monotonic));
+    try std.testing.expectEqual(0, class_mask.load(.monotonic));
     try std.testing.expectEqual(null, writer);
 }
 
@@ -421,5 +448,26 @@ test "instrument source locations are defined once beyond 128 distinct locations
     for (1..257) |id| {
         try std.testing.expect(thread.defineSource(id, @src()));
         try std.testing.expect(thread.buffers[0].empty());
+    }
+}
+
+test "instrument task ids remain nonzero and unique across thread block rollovers" {
+    next_task_id.store(1, .monotonic);
+    defer next_task_id.store(1, .monotonic);
+    const a = try std.testing.allocator.create(Thread);
+    defer std.testing.allocator.destroy(a);
+    const b = try std.testing.allocator.create(Thread);
+    defer std.testing.allocator.destroy(b);
+    a.init(-1, 1, .{});
+    b.init(-1, 2, .{});
+    var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer ids.deinit(std.testing.allocator);
+    for (0..task_id_block * 2 + 1) |_| {
+        for ([_]*Thread{ a, b }) |thread| {
+            const id = thread.nextTaskId();
+            try std.testing.expect(id != 0);
+            const entry = try ids.getOrPut(std.testing.allocator, id);
+            try std.testing.expect(!entry.found_existing);
+        }
     }
 }

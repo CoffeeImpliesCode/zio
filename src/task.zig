@@ -564,7 +564,7 @@ pub const AnyTask = struct {
 
         // Re-fetch executor — task may have migrated during execution
         executor = getCurrentExecutor();
-        @import("instrument/root.zig").end(self, .finish);
+        @import("instrument/root.zig").endOn(executor, self, .finish);
         executor.pending_cleanup = .{ .finish = self };
         executor.switchOut(&self.coro);
         unreachable;
