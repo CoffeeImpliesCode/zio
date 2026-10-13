@@ -28,6 +28,12 @@ All notable changes to this project will be documented in this file.
 - Added `File.syncRange`, a wrapper for Linux's `sync_file_range`, to start writeback of
   a byte range ahead of a `sync`.
 
+- Added optional runtime tracing, compiled in with `-Dinstrument=true` (or
+  `zio_options.instrument`) and started with `ZIO_PROFILE=1`. It records per-thread task,
+  scheduler, event loop, I/O and blocking pool events under `.zio/<timestamp>/`, and the
+  new `zio-trace` tool turns them into utilization plots, statistics and Perfetto
+  timelines. See `docs/instrumentation.md`.
+
 ### Fixed
 
 - Sockets accepted with the io_uring backend were blocking and leaked into child processes,

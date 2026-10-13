@@ -205,16 +205,19 @@ pub const ThreadPool = struct {
     }
 
     pub fn submit(self: *ThreadPool, work: *Work) void {
+        @import("../instrument/root.zig").emit(.work_queue, .{ .work = @intFromPtr(work) });
         if (builtin.single_threaded or self.max_threads == 0) {
             if (work.state.cmpxchgStrong(.pending, .running, .acq_rel, .acquire)) |state| {
                 std.debug.assert(state == .canceled);
                 work.c.setError(error.Canceled);
             } else {
                 if (work.cancel_token) |token| token.enter();
+                @import("../instrument/root.zig").emit(.work_begin, .{ .work = @intFromPtr(work) });
                 work.func(work);
                 if (work.cancel_token) |token| token.exit();
                 work.c.setResult(.work, {});
                 work.state.store(.completed, .release);
+                @import("../instrument/root.zig").workEnd(work);
             }
             if (work.completion_fn) |completion_fn| {
                 completion_fn(work.completion_context, work);
@@ -320,6 +323,8 @@ pub const ThreadPool = struct {
     }
 
     fn run(self: *ThreadPool, worker_id: u64) void {
+        @import("../instrument/root.zig").threadInit();
+        defer @import("../instrument/root.zig").threadExit();
         while (true) {
             const shutdown = self.runTasks();
             if (self.removeThread(worker_id, shutdown)) return;
@@ -368,11 +373,13 @@ pub const ThreadPool = struct {
                 work.c.setError(error.Canceled);
             } else {
                 // We successfully claimed it, execute the work
+                @import("../instrument/root.zig").emit(.work_begin, .{ .work = @intFromPtr(work) });
                 if (work.cancel_token) |token| token.enter();
                 work.func(work);
                 if (work.cancel_token) |token| token.exit();
                 work.c.setResult(.work, {});
                 work.state.store(.completed, .release);
+                @import("../instrument/root.zig").workEnd(work);
             }
 
             // Reserved job no longer occupies a worker; drop the ceiling before

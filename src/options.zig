@@ -69,6 +69,10 @@ pub const Options = struct {
     /// it, the signature of a swallowed cancellation. The report prints the
     /// stack trace of the delivery and of the park, once per task.
     debug_cancel: bool = build_options.debug_cancel,
+    /// Compile in runtime event tracing. When false, every instrumentation
+    /// path is compiled out. When true, tracing starts only if the process
+    /// runs with `ZIO_PROFILE=1`; see `src/instrument/root.zig`.
+    instrument: bool = build_options.instrument,
 };
 
 /// The resolved configuration. A `-fsingle-threaded` build has only one

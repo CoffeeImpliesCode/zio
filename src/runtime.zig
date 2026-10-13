@@ -35,6 +35,7 @@ const finishTask = @import("task.zig").finishTask;
 const spawnBlockingTask = @import("blocking_task.zig").spawnBlockingTask;
 const Group = @import("group.zig").Group;
 
+const instrument = @import("instrument/root.zig");
 const dns = @import("dns/root.zig");
 
 const select = @import("select.zig");
@@ -577,6 +578,7 @@ pub const Executor = struct {
             .runtime = runtime,
             .shutdown = ev.Async.init(),
         };
+        instrument.executorRegister(self);
 
         // With migration, overflow goes to the shared queue that every executor
         // drains; otherwise the ring keeps its own.
@@ -631,6 +633,7 @@ pub const Executor = struct {
         self.main_task.coro.setCurrent();
         setCurrentExecutor(self);
         self.current_task = &self.main_task;
+        instrument.executorInit(self);
     }
 
     pub fn deinit(self: *Executor) void {
@@ -640,6 +643,7 @@ pub const Executor = struct {
         self.loop.deinit();
 
         cleanupStackGrowth();
+        instrument.executorExit(self);
     }
 
     fn shutdownCallback(loop: *ev.Loop, _: *ev.Completion) void {
@@ -751,6 +755,8 @@ pub const Executor = struct {
 
     /// Run the executor event loop.
     pub fn run(self: *Executor, mode: RunMode) !void {
+        instrument.mainLeave(self, mode);
+        defer instrument.mainReturn(self, mode);
         const check_ready = mode != .until_stopped;
 
         // The run loop is scheduler code, not a task: clear current_task so any I/O
@@ -782,6 +788,7 @@ pub const Executor = struct {
             while (self.getNextTask()) |next_task| {
                 updateParentContext(next_task, &self.main_task.coro.context);
                 self.current_task = next_task;
+                instrument.begin(next_task);
                 next_task.coro.step();
                 self.current_task = null;
                 self.processCleanup();
@@ -855,7 +862,9 @@ pub const Executor = struct {
     fn parkAndSearch(self: *Executor, check_ready: bool) !void {
         if (!migrates) {
             self.bump("parks_full", 1);
+            instrument.parkBegin(Duration.max);
             try self.loop.poll(.max);
+            instrument.emit(.park_end, .{});
             self.drainDispatched();
             return;
         }
@@ -864,7 +873,9 @@ pub const Executor = struct {
         // real park; skip it.
         if (self.runtime.stealingActive()) {
             self.bump("parks_doze", 1);
+            instrument.parkBegin(Duration.zero);
             try self.loop.poll(.zero);
+            instrument.emit(.park_end, .{});
             self.drainDispatched();
             if (self.checkLocalWork(check_ready)) return self.leaveIdle();
         }
@@ -919,7 +930,9 @@ pub const Executor = struct {
         if (!found_work) found_work = self.rescueStuck();
         const wait: Duration = if (found_work) .zero else if (self.holdBaton()) baton_tick else .max;
         if (wait.value == baton_tick.value) self.bump("baton_parks", 1);
+        instrument.parkBegin(wait);
         try self.loop.poll(wait);
+        instrument.emit(.park_end, .{});
         // Drain before withdrawing the bit, so the post-park work checks
         // below see the woken batch.
         self.drainDispatched();
@@ -1120,6 +1133,7 @@ pub const Executor = struct {
 
             if (self.run_queue.steal(&victim.run_queue)) |node| {
                 _ = self.run_queue.push(node);
+                instrument.emit(.steal, .{ .victim = victim.id, .count = 1 });
                 self.bump("steal_hits", 1);
                 if (hint_start and i == 0) self.bump("steal_hint_hits", 1);
                 // The rest of the loaded ring is still at the victim; point
@@ -1257,6 +1271,7 @@ pub const Executor = struct {
             }
             break;
         }
+        instrument.wake(task);
 
         const home_exec = Executor.fromCoroutine(&task.coro);
 
@@ -1354,6 +1369,7 @@ pub const Executor = struct {
         if (self.getNextTask()) |next_task| {
             updateParentContext(next_task, &self.main_task.coro.context);
             self.current_task = next_task;
+            instrument.begin(next_task);
             coro.yieldTo(&next_task.coro);
         } else {
             coro.yield();
@@ -1646,6 +1662,8 @@ pub const Runtime = struct {
     }
 
     pub fn initStatic(self: *Runtime, allocator: Allocator, options: RuntimeOptions) !void {
+        instrument.runtimeInit();
+        errdefer instrument.runtimeDeinit();
         const num_executors = options.executors.resolve();
         const num_workers = if (options.enable_main_executor) num_executors - 1 else num_executors;
 
@@ -1806,6 +1824,7 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
+        defer instrument.runtimeDeinit();
         const allocator = self.allocator;
 
         // Set shutting_down flag to prevent new spawns
@@ -1879,6 +1898,8 @@ pub const Runtime = struct {
             }
         };
 
+        instrument.spawnFunction(&func);
+        defer instrument.clearSpawnFunction();
         const task = try spawnTask(
             self,
             @sizeOf(Result),
@@ -1908,6 +1929,8 @@ pub const Runtime = struct {
             }
         };
 
+        instrument.spawnFunction(&func);
+        defer instrument.clearSpawnFunction();
         const task = try spawnBlockingTask(
             self,
             @sizeOf(Result),

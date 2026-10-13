@@ -332,6 +332,7 @@ pub const LoopState = struct {
     }
 
     pub fn finishCompletion(self: *LoopState, completion: *Completion) void {
+        @import("../instrument/root.zig").ioComplete(completion);
         completion.enterDead();
 
         // Both callbacks below can free `completion`, so whichever may free it must
@@ -622,12 +623,18 @@ pub const Loop = struct {
     /// Wake up the loop from another thread (thread-safe). Costs a syscall
     /// only when the loop is sleeping in its poll and nobody has woken it yet.
     pub fn wake(self: *Loop) void {
-        if (self.state.requestWake(LoopState.wake_loop)) self.backend.wake(&self.state);
+        if (self.state.requestWake(LoopState.wake_loop)) {
+            @import("../instrument/root.zig").loopWake(self, true);
+            self.backend.wake(&self.state);
+        }
     }
 
     /// Wake up the loop to process async handles (thread-safe)
     pub fn wakeAsync(self: *Loop) void {
-        if (self.state.requestWake(LoopState.wake_async)) self.backend.wake(&self.state);
+        if (self.state.requestWake(LoopState.wake_async)) {
+            @import("../instrument/root.zig").loopWake(self, true);
+            self.backend.wake(&self.state);
+        }
     }
 
     /// Set or reset a timer with a new timeout (works immediately, no completion required)
@@ -654,6 +661,7 @@ pub const Loop = struct {
             timer.c.err = null;
             timer.c.setLoop(self);
             _ = timer.c.enterRunning();
+            @import("../instrument/root.zig").ioSubmit(&timer.c);
         }
         self.state.armTimer(timer);
     }
@@ -719,7 +727,10 @@ pub const Loop = struct {
                 head = target.cancel_queue.cmpxchgWeak(head, completion, .release, .acquire) orelse break;
             }
 
-            if (target.state.requestWake(LoopState.wake_cancel)) target.backend.wake(&target.state);
+            if (target.state.requestWake(LoopState.wake_cancel)) {
+                @import("../instrument/root.zig").loopWake(target, true);
+                target.backend.wake(&target.state);
+            }
         }
     }
 
@@ -864,6 +875,7 @@ pub const Loop = struct {
     }
 
     fn addInternal(self: *Loop, completion: *Completion) void {
+        @import("../instrument/root.zig").ioSubmit(completion);
         completion.setLoop(self);
         const old = completion.enterRunning();
         if (old.phase == .dead) {
@@ -1447,7 +1459,9 @@ pub const Loop = struct {
                 timeout = .zero;
             }
         }
+        @import("../instrument/root.zig").pollBegin(should_poll, timeout);
         const timed_out = if (should_poll) try self.backend.poll(&self.state, timeout) else false;
+        @import("../instrument/root.zig").pollEnd(should_poll, timed_out);
         // Awake again: take the requests, including any that arrived during
         // the poll, and clear `sleeping`.
         const wake_flags = self.state.wake_requested.swap(0, .acq_rel);

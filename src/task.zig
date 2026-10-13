@@ -195,6 +195,7 @@ pub const AnyTask = struct {
     /// Head of this task's intrusive task-local binding chain (see `TaskLocal`).
     /// Only ever accessed by the task itself, so it needs no synchronization.
     tls_head: ?*TaskLocalNode = null,
+    instr: @import("instrument/root.zig").TaskData = .{},
 
     /// See `Options.debug_cancel`. Only accessed by the task itself.
     cancel_debug: if (zio_options.debug_cancel) CancelDebug else void = if (zio_options.debug_cancel) .{} else {},
@@ -320,6 +321,7 @@ pub const AnyTask = struct {
             .reschedule => .{ .reschedule = self },
         };
 
+        @import("instrument/root.zig").suspendTask(self, mode, executor);
         if (self == &executor.main_task) {
             // Main task enters the run loop instead of context switching
             executor.run(.until_ready) catch |err| {
@@ -562,6 +564,7 @@ pub const AnyTask = struct {
 
         // Re-fetch executor — task may have migrated during execution
         executor = getCurrentExecutor();
+        @import("instrument/root.zig").end(self, .finish);
         executor.pending_cleanup = .{ .finish = self };
         executor.switchOut(&self.coro);
         unreachable;
@@ -827,6 +830,7 @@ pub fn spawnTask(
 
     if (group) |g| try registerGroupTask(g, &task.awaitable);
     errdefer if (group) |g| unregisterGroupTask(g, &task.awaitable);
+    @import("instrument/root.zig").taskCreate(task, start, executor.id, group);
 
     try registerTask(rt, task);
 

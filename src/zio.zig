@@ -9,6 +9,9 @@ const options = @import("options.zig");
 /// in your root module to set it.
 pub const Options = options.Options;
 pub const Scheduling = options.Scheduling;
+/// Trace markers (zones, messages, plots); no-ops unless built with
+/// `-Dinstrument=true` and run with `ZIO_PROFILE=1`.
+pub const instrument = @import("instrument/root.zig").user;
 
 const runtime = @import("runtime.zig");
 pub const Runtime = runtime.Runtime;
@@ -117,4 +120,5 @@ test {
     _ = @import("stderr.zig");
     _ = @import("os/syscall_cancel.zig");
     _ = @import("compat.zig");
+    _ = @import("instrument/root.zig");
 }

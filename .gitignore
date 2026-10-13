@@ -8,6 +8,9 @@
 /test-file
 /zio_test_*
 
+# Trace sessions written by instrumented builds run with ZIO_PROFILE=1
+.zio/
+
 # Benchmark build artifacts
 /benchmarks/target/
 /benchmarks/echo_server_go

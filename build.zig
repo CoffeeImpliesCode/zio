@@ -15,6 +15,7 @@ pub fn build(b: *std.Build) void {
     const no_hacks = b.option(bool, "no-hacks", "Avoid unsafe performance tricks (bool smuggling, etc.)");
     const scheduler_metrics = b.option(bool, "scheduler_metrics", "Count scheduler events (parks, steals, wake batches) in per-executor counters readable via Runtime.schedulerMetrics (default true)");
     const debug_cancel = b.option(bool, "debug_cancel", "Report tasks that keep running after swallowing error.Canceled, with stack traces (default false)");
+    const instrument = b.option(bool, "instrument", "Compile in runtime event tracing, activated at run time by ZIO_PROFILE=1 (default false)");
 
     const build_options: BuildOptions = .{
         .backend = backend,
@@ -23,6 +24,7 @@ pub fn build(b: *std.Build) void {
         .no_hacks = no_hacks orelse false,
         .scheduler_metrics = scheduler_metrics orelse true,
         .debug_cancel = debug_cancel orelse false,
+        .instrument = instrument orelse false,
     };
 
     const zio = b.addModule("zio", .{
@@ -68,6 +70,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "coro-demo", .file = "examples/coro_demo.zig" },
         .{ .name = "ev-demo", .file = "examples/ev_demo.zig" },
         .{ .name = "stderr-smoke", .file = "examples/stderr_smoke.zig" },
+        .{ .name = "trace-demo", .file = "examples/trace_demo.zig" },
     };
 
     // Create examples step. -Dexample=<name> limits it to a single example
@@ -125,6 +128,29 @@ pub fn build(b: *std.Build) void {
         run_lib_unit_tests.has_side_effects = true;
         test_step.dependOn(&run_lib_unit_tests.step);
     }
+
+    // Offline trace analyzer: reads the .zio/<session>/ dumps written by an
+    // instrumented build. Depends on the trace format only, not on zio.
+    const trace_format = b.createModule(.{
+        .root_source_file = b.path("src/instrument/format.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const zio_trace_module = b.createModule(.{
+        .root_source_file = b.path("tools/zio-trace/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zio_trace_format", .module = trace_format }},
+    });
+    const zio_trace = b.addExecutable(.{ .name = "zio-trace", .root_module = zio_trace_module });
+    const install_zio_trace = b.addInstallArtifact(zio_trace, .{});
+    b.step("zio-trace", "Build the zio-trace analyzer").dependOn(&install_zio_trace.step);
+
+    const zio_trace_tests = b.addTest(.{ .root_module = zio_trace_module });
+    const format_tests = b.addTest(.{ .root_module = trace_format });
+    const trace_test_step = b.step("test-zio-trace", "Run the trace format and analyzer tests");
+    trace_test_step.dependOn(&b.addRunArtifact(zio_trace_tests).step);
+    trace_test_step.dependOn(&b.addRunArtifact(format_tests).step);
 }
 
 const BuildOptions = struct {
@@ -138,6 +164,7 @@ const BuildOptions = struct {
     no_hacks: bool,
     scheduler_metrics: bool,
     debug_cancel: bool,
+    instrument: bool,
 
     // Enums are passed as tag names and mapped back to zio's own types in
     // src/options.zig.
@@ -149,6 +176,7 @@ const BuildOptions = struct {
         options.addOption(bool, "no_hacks", self.no_hacks);
         options.addOption(bool, "scheduler_metrics", self.scheduler_metrics);
         options.addOption(bool, "debug_cancel", self.debug_cancel);
+        options.addOption(bool, "instrument", self.instrument);
         return options;
     }
 };

@@ -144,6 +144,8 @@ pub const Group = struct {
             }
         };
 
+        @import("instrument/root.zig").spawnFunction(&func);
+        defer @import("instrument/root.zig").clearSpawnFunction();
         const context: Context = .{ .group = self, .args = args };
         return groupSpawnTask(self, rt, std.mem.asBytes(&context), .fromByteUnits(@alignOf(Context)), &Wrapper.start, placement);
     }
@@ -173,6 +175,8 @@ pub const Group = struct {
         };
 
         const context: Context = .{ .group = self, .args = args };
+        @import("instrument/root.zig").spawnFunction(&func);
+        defer @import("instrument/root.zig").clearSpawnFunction();
         return groupSpawnBlockingTask(self, rt, std.mem.asBytes(&context), .fromByteUnits(@alignOf(Context)), &Wrapper.start, .{});
     }
 
